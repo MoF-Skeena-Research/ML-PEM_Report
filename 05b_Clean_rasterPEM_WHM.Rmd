@@ -1,0 +1,315 @@
+---
+title: "05a_Clean Raster PEM"
+author: "G. Perkins & W. MacKenzie"
+date: "06/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(dplyr)
+library(readxl)
+library(stringr)
+library(raster)
+library(stars)
+require(data.table)
+#install.packages("pemgeneratr")
+
+```
+
+This script will merge different modelled maps together and do some simplification to create a final raster map
+1. Replace cutblocks with a forest only map
+2. Add in a water layer
+3. Merge a non-forest model into a forest model
+
+May sieve a raster map to remove individual or small cluster types
+
+```{r set up folders, echo = FALSE}
+
+AOI <- "Deception"
+
+#AOI <- "DateCreek"
+
+
+#read in functions: 
+source(here::here('_functions', 'predict_map_tidy.R'))
+## folder with BGC random forest models
+outDir <- "../PEM_standards_manuscripts/models/paper_ss_all_var/rF_models"
+
+# set up file structure
+AOI_dir <- file.path("..", paste0(AOI,"_AOI"))
+cov_dir <- file.path(AOI_dir, "1_map_inputs", "covariates")
+shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+out_dir <- file.path(AOI_dir, "3_maps_analysis","models")
+out_dir <- file.path(AOI_dir, "models")
+input_pnts_dir <- file.path(AOI_dir, "1_map_inputs", "trainingData", "att_5m")
+bec_shp <- st_read(file.path(shapes_dir, "bec.gpkg"), quiet = TRUE)
+  
+# read in map and model keys
+map.key <-  read.csv("../PEM_standards_manuscripts/_MapUnitLegend/Deception_MapUnitLegend.csv", 
+                       stringsAsFactor = FALSE)
+#map.key <- read.csv(paste0(AOI_dir, "/_MapUnitLegend/", AOI, "_MapUnitLegend.csv"))
+
+model_param <- file.path("../PEM_standards_manuscripts/_MapUnitLegend/models_WHM.xlsx")
+
+# set up model parameters:  
+mparam <- read_xlsx(model_param, "models") %>% filter(to_run == 1)
+map_res <- mparam$resolution
+mname <- paste0(mparam$model_name)
+mrep <- mparam$model_rep
+
+# check which catergory of model to be produced
+mtype <- case_when(
+  str_detect(mname, "for_nf")  ~ "forest_non_forest",
+  str_detect(mname, "nf_") ~ "non_forest",
+  str_detect(mname, "fore") ~ "forest"
+)
+
+# get covariates for model
+mcov <- read_xlsx(model_param, "covariates", skip = 2) %>%
+  filter(!!sym(mparam$covariates) == 1) %>%
+  dplyr::select(covariate)
+
+
+```
+
+
+## Generate final AOI map by joining BGC map mosaics together
+
+```{r combine BGC maps into single AOI map}
+# Assemble the BGC's maps: 
+
+AOI <- "Deception"
+AOI <- "DateCreek"
+# set up file structure
+AOI_dir <- file.path("..", paste0(AOI,"_AOI"))
+cov_dir <- file.path(AOI_dir, "1_map_inputs", "covariates")
+shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+out_dir <- file.path("../PEM_standards_manuscripts/models", mname, "maps")
+
+# load bgc layer
+
+bec_shp <- st_read(file.path(shapes_dir, "bec.gpkg"), quiet = TRUE) %>%
+  mutate(MAP_LABEL = gsub(" ","",MAP_LABEL))
+
+aoi <- st_read(file.path(shapes_dir, "AOI.gpkg"), quiet = TRUE)
+
+# read in map and model keys
+map.key  <- fread("D:/GitHub/PEM_Methods_DevX/PEM_standards_manuscripts/_MapUnitLegend/Deception_MapUnitLegend.csv")
+
+map_dir = paste0("../PEM_standards_manuscripts/models/", mname, "/rF_models")
+
+
+#folders <- as.list(c("SBSmc2")) 
+folders <- as.list(c("ESSFmc", "ESSFmcw", "SBSmc2")) 
+
+# step 1:  set up a key for the combined map (includes all the units)
+rkey <- lapply(folders, function (f){
+  
+  keys <- read.csv(file.path(map_dir, f, "response_names.csv")) %>%
+    mutate(model  = f)
+})
+
+rkey <- do.call("rbind", rkey)
+rkey <- rkey %>% dplyr::mutate(map.response = seq(1:length(x)))
+
+source("../_functions/_combine_maps.R")# create mosaic using GDAL
+#rast_list <- list.files(file.path(cov_dir, res_folder), pattern = ".tif$", full.names = TRUE)
+# rast_list <- list.files("D:/GitHub/PEM_Methods_DevX/PEM_standards_manuscripts/models/predicted/SBSmc2", pattern = ".tif$", full.names = TRUE)
+# mosaic_rasters(gdalfile=rast_list,dst_dataset="./models/predicted/SBSmc2/SBSmc2_mapmosaic.tif",of="GTiff")
+
+# join all the BGC specific maps together for AOI
+
+
+if(length(folders) == 3) {
+  
+  all_key <- merge(combine_maps[[1]], combine_maps[[2]], overlap=TRUE)
+  all_key <- merge(all_key, combine_maps[[3]], overlap = TRUE)
+
+} 
+
+# all_key <- merge(combo_map[[1]], combo_map[[2]], overlap=TRUE)
+# all_key <- merge(all_key, combo_map[[3]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[4]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[5]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[6]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[7]], overlap = TRUE)
+
+# tidy key and output maps
+rkey <- rkey %>% dplyr::select(x, model, map.response)
+
+### update raster values to match master key of all units
+rkey_master <- fread("../PEM_standards_manuscripts/models/response_combo_bgcs_key_all.csv")
+rkey_master2 <- left_join(rkey_master, rkey, by = 'x') %>% dplyr::select(x, map.response.x, map.response.y) %>% filter(!is.na(map.response.y)) %>%  distinct(x, .keep_all = TRUE) %>% data.frame
+
+ raster::subs(all_key, rkey_master2, by = 'map.response.y', which = 'map.response.x', filename=file.path(out_dir, "only_forest_combo_bgcs_renumbered.tif"), overwrite = TRUE)
+
+ ###for some reason terra does not keep all the correct response numbers - but is a lot faster
+# require(terra)
+# all_key_sr <- terra::rast(all_key)
+# all_key_sr2 <- terra::subst(all_key_sr, rkey_master2$map.response.y, rkey_master2$map.response.x, filename=file.path(out_dir, "forest_combo_bgcs_renumbered_terra.tif"), overwrite = TRUE)
+
+writeRaster(all_key, file.path(out_dir, "forest_combo_bgcs.tif"), overwrite = TRUE)
+
+write.csv(rkey, file.path(out_dir, "response_combo_bgcs_key.csv"))
+
+```
+
+```{r clear cutblocks from all variable map }
+###currently using Patching in Qgis to replace cutblock NA with the DEM only map 
+cutblk <- st_read("../Deception_AOI/0_raw_inputs/base_layers/cleared_areas_atSentinelTime_updated.gpkg", quiet = TRUE)
+require(fasterize)
+cutblk_rast <- fasterize(aoi, all_key)
+#cutblk_rast [cutblk_rast  > 0] <- NA
+plot(cutblk_rast)
+all_map <- raster("../PEM_standards_manuscripts/models/paper_all_var/maps/forest_combo_bgcs_all.tif")
+
+all_key_masked <- mask(all_map,
+                               mask = cutblk_rast, inverse=TRUE)
+
+writeRaster(all_key_masked, "../PEM_standards_manuscripts/models/paper_all_var/maps/forest_combo_bgcs_masked.tif", overwrite = TRUE)
+
+```
+
+
+
+# generate map for forest/non_forest split 
+
+```{r}
+# temp fix 
+
+# read in non-forest map generated at 5m accuracy
+nf_f <- file.path(out_dir, "forest_non_forest/for_nfor_all/2/for_nfor_all/predicted/")
+list.files(nf_f)
+
+
+# generate rasters for AOI 
+nf_f_map <- terra::rast(file.path(nf_f, "response.tif"))
+nf_f_key <- read.csv(file.path(nf_f, "response_names.csv"))
+
+nf_f_key <- nf_f_key %>% mutate(x = case_when(
+  x == "clearcut" ~ "forest", 
+  TRUE ~ as.character(.$x)))
+
+nf_f_key
+#  X         x
+# 1  clearcut
+# 2    forest
+# 3 nonforest
+# 4     water
+
+m <- c(1,2, 1)
+rclmat <- matrix(m, ncol=3, byrow=TRUE)
+forest_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+
+m <- c(4, 1)
+rclmat <- matrix(m, ncol=2, byrow=TRUE)
+water_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+
+m <- c(3, 1)
+rclmat <- matrix(m, ncol=2, byrow=TRUE)
+nf_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+
+
+##aoi_poly <- aoi %>% 
+#  st_as_sf(as_points = FALSE, merge = TRUE, na.rm = TRUE, use_integer = TRUE) %>%
+#  st_transform(3005) %>%
+#  left_join(aoi_key, by = c("response.tif" = "X"))
+
+
+```
+
+
+# generate the non-forest map and join to forested map
+
+```{r}
+# inorder to generate the non -forest model and join to the forested model we need to select the model of inerest : 
+
+# define 
+#- forest / non-forest mask model
+#- forested model
+#- non-forest model 
+
+# AOI <- "Deception"
+# #AOI <- "BoundaryTSA"
+# 
+# # set up file structure
+# AOI_dir <- file.path(".", paste0(AOI,"_AOI"))
+# out_dir <- file.path(AOI_dir, "3_maps_analysis","models")
+# shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+# 
+# fnf <- file.path(out_dir, "forest_non_forest", "for_nfor", "2")
+# f <- file.path(out_dir, "forest", "for_mu_bgc", "76")
+# nf <- file.path(out_dir, "non_forest","nf_class","2")
+# 
+# # read in non-forest and forest split
+# #nff_map <- stars::read_stars(file.path(fnf, "mosaic.tif"))
+# nff_map  <- raster(file.path(fnf, "mosaic.tif"))
+# nff_key <- read.csv(file.path(fnf, "response_names.csv"))
+# 
+# # read in non-forest map generated at 5m accuracy
+# nf_map <- raster(file.path(nf, "mosaic.tif"))
+# nf_key <- read.csv(file.path(nf, "response_names.csv"))
+# 
+# # crop to AOI and write out 
+# #all_key <- read_stars(file.path(map_dir, "mosaic.tif"))
+# #all_key <- st_crop(all_key, aoi)
+# #stars::write_stars(all_key, file.path(map_dir, "mosaic1.tif")) #tile name
+#        
+# 
+# 
+# 
+# aoi = st_read(file.path(shapes_dir, "AOI.gpkg")) %>%
+#   st_transform(3005) 
+# 
+# 
+# # crop to AOI and write out 
+# all_key <- read_stars(file.path(nf, "mosaic.tif"))
+# all_key <- st_crop(all_key, aoi)
+# stars::write_stars(all_key, file.path(map_dir, "mosaic_aoi.tif")) #tile name
+#     
+# 
+# ## Generate the non-forest mask 
+# #f_mask <- nff_map < 3
+# #w_mask <- nff_map == 3
+# 
+# nf_maks <- nff_map == 4 
+# 
+# nf_mask <- mask(nf_maks, as(aoi,'Spatial'))
+# nf_maskpoly <- st_as_sf(nf_mask)
+# 
+# 
+# 
+# 
+# 
+# nf_map_masked <- mask(nf_map, nf_mask) 
+# 
+# writeRaster(nf_mask, file.path(nf, "nf_filter.tif"), overwrite = TRUE)
+
+
+
+# m <- c(1,2, 1)
+# rclmat <- matrix(m, ncol=3, byrow=TRUE)
+# forest_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+# 
+# m <- c(4, 1)
+# rclmat <- matrix(m, ncol=2, byrow=TRUE)
+# water_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+# 
+# m <- c(3, 1)
+# rclmat <- matrix(m, ncol=2, byrow=TRUE)
+# nf_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+
+
+
+
+
+
+
+```
+
+
+ 
+         
+

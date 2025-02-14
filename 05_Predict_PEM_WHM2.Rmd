@@ -1,0 +1,528 @@
+---
+title: "05a_PEM_predict_map"
+author: "G. Perkins & W. MacKenzie"
+date: "06/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(dplyr)
+library(readxl)
+library(stringr)
+library(raster)
+library(stars)
+require(data.table)
+require(terra)
+#install.packages("pemgeneratr")
+devtools::load_all("D:\\GitHub\\PEMprepr")
+devtools::load_all("D:\\GitHub\\PEMsamplr")
+devtools::load_all("D:\\GitHub\\PEMmodelr")
+
+library(PEMprepr)
+library(PEMmodelr)
+library(dplyr)
+library(forcats)
+
+
+```
+
+```{r set up folders, echo = FALSE}
+
+AOI <- "Deception"
+
+#AOI <- "DateCreek"
+
+
+#read in functions: 
+source(here::here('_functions', 'predict_map_tidy.R'))
+## folder with BGC random forest models
+outDir <- "./PEM_standards_manuscripts/models/paper_all_var/rF_models"
+
+# set up file structure
+AOI_dir <- file.path(".", paste0(AOI,"_AOI"))
+cov_dir <- file.path(AOI_dir, "1_map_inputs", "covariates")
+shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+out_dir <- file.path(AOI_dir, "3_maps_analysis","models")
+out_dir <- file.path(AOI_dir, "models")
+input_pnts_dir <- file.path(AOI_dir, "1_map_inputs", "trainingData", "att_5m")
+bec_shp <- st_read(file.path(shapes_dir, "bec.gpkg"), quiet = TRUE)
+  
+# read in map and model keys
+map.key <-  read.csv("./PEM_standards_manuscripts/_MapUnitLegend/Deception_MapUnitLegend.csv", 
+                       stringsAsFactor = FALSE)
+#map.key <- read.csv(paste0(AOI_dir, "/_MapUnitLegend/", AOI, "_MapUnitLegend.csv"))
+
+model_param <- file.path("./PEM_standards_manuscripts/_MapUnitLegend/models_WHM.xlsx")
+
+# set up model parameters:  
+mparam <- read_xlsx(model_param, "models") %>% filter(to_run == 1)
+map_res <- mparam$resolution
+mname <- paste0(mparam$model_name)
+mrep <- mparam$model_rep
+
+# check which catergory of model to be produced
+mtype <- case_when(
+  str_detect(mname, "for_nf")  ~ "forest_non_forest",
+  str_detect(mname, "nf_") ~ "non_forest",
+  str_detect(mname, "fore") ~ "forest"
+)
+
+# get covariates for model
+mcov <- read_xlsx(model_param, "covariates", skip = 2) %>%
+  filter(!!sym(mparam$covariates) == 1) %>%
+  dplyr::select(covariate)
+
+
+```
+
+
+```{r set up covariates stack }
+
+map_res = 5
+res_folder <- paste0(map_res, "m_new")
+
+rast_list <- list.files(file.path(cov_dir, res_folder), pattern = ".tif$", full.names = TRUE)
+
+# filter based on covariate for model param
+rast_list <- rast_list[tolower(gsub(".tif", "", basename(rast_list))) %in% tolower(mcov$covariate)]
+
+testrast <- terra::rast(file.path(cov_dir, res_folder,"all_mosaic_rproj.tif"))
+temp_ex = terra::ext(testrast)
+
+for(i in 1:length(rast_list)){
+#  i = 1
+  rn <- rast_list[i]
+  #print(rn)
+  r1 <- rast(rn)
+  terra::crs(r1) <- "epsg:3005"
+  # name <- "D:/GitHub/PEM_Methods_DevX/Deception_AOI/1_map_inputs/covariates/5m_new/"
+  # name.r1 <- r1@ptr$names
+  # writeRaster(r1, paste0(name, "/", name.r1, ".tif"), overwrite=TRUE)
+  if(ext(r1) == temp_ex) {
+    #print(paste0(i,"_matching"))
+  } else {
+    print(rn)
+    print("notmatching")
+  }
+}
+
+
+```
+
+
+#Generate a map tiles and map mosaic for each BGC
+
+```{r Predict map tiles}
+require(tictoc)
+bgcs = c("ESSFmcw")#,"SBSmc2","ESSFmc")
+#bgcs = c("ESSFmcw")
+outDir <- "./PEM_standards_manuscripts/models/paper_all_var/rF_models"
+#bgcs = c("ICHmc2")
+# cov_list <- list.files(file.path(cov_dir, res_folder), pattern = ".tif$", 
+#                              full.names = TRUE)
+# 
+# temp_ex = extent(testrast)
+# 
+# for(i in 1:length(cov_list)){
+# #  i = 1
+#   rn <- cov_list[i]
+#   #print(rn)
+#   r1 <- raster(rn)
+#   if(extent(r1) == temp_ex) {
+#     "matching"
+#   } else {
+#     print(rn)
+#     print("notmatching")
+#   }
+# }
+
+#predict_map <- function(model, out_dir, tile_size = 500, tile_dir, rstack, probability = FALSE){
+bgc = "ESSFmc"
+tic()
+  for( bgc in bgcs) {
+    tic() 
+     
+      #outDir2 <- paste0(outDir, "/", bgc)
+    outDir2 <- paste0(outDir, "/", bgc)
+      model <- list.files(outDir2, pattern="*.rds")
+      model <- paste0(outDir2, "/", model)
+      predict_map(
+        model = model,
+        rstack = rast_list,
+        tile_size = 500,
+        out_dir = outDir2)
+      toc()
+  } 
+toc()
+```
+
+## Generate final AOI map by joining BGC map mosaics together
+
+```{r combine BGC maps into single AOI map}
+# Assemble the BGC's maps: 
+
+AOI <- "Deception"
+#AOI <- "DateCreek"
+# set up file structure
+AOI_dir <- file.path("..", paste0(AOI,"_AOI"))
+cov_dir <- file.path(AOI_dir, "1_map_inputs", "covariates")
+shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+out_dir <- file.path("../PEM_standards_manuscripts/models", mname, "combined_raster_maps")
+
+# load bgc layer
+
+bec_shp <- st_read(file.path(shapes_dir, "bec.gpkg"), quiet = TRUE) %>%
+  mutate(MAP_LABEL = gsub(" ","",MAP_LABEL))
+
+aoi <- st_read(file.path(shapes_dir, "AOI.gpkg"), quiet = TRUE)
+
+# read in map and model keys
+map.key  <- fread("D:/GitHub/PEM_Methods_DevX/PEM_standards_manuscripts/_MapUnitLegend/Deception_MapUnitLegend.csv")
+
+map_dir = paste0("../PEM_standards_manuscripts/models/", mname, "/rF_models")
+
+
+#folders <- as.list(c("SBSmc2")) 
+folders <- as.list(c("ESSFmc", "ESSFmcw", "SBSmc2")) 
+#f = "ESSFmcw"
+# step 1:  set up a key for the combined map (includes all the units)
+rkey <- lapply(folders, function (f){
+  
+  keys <- read.csv(file.path(map_dir, f, "response_names.csv")) %>%
+    mutate(model  = f)
+})
+
+rkey <- do.call("rbind", rkey)
+rkey <- rkey %>% dplyr::mutate(map.response = seq(1:length(x)))
+
+source("../_functions/_combine_maps.R")# create mosaic using GDAL
+#rast_list <- list.files(file.path(cov_dir, res_folder), pattern = ".tif$", full.names = TRUE)
+# rast_list <- list.files("D:/GitHub/PEM_Methods_DevX/PEM_standards_manuscripts/models/predicted/SBSmc2", pattern = ".tif$", full.names = TRUE)
+# mosaic_rasters(gdalfile=rast_list,dst_dataset="./models/predicted/SBSmc2/SBSmc2_mapmosaic.tif",of="GTiff")
+
+# join all the BGC specific maps together for AOI
+
+
+if(length(folders) == 3) {
+  
+  all_key <- merge(combine_maps[[1]], combine_maps[[2]], overlap=TRUE)
+  all_key <- merge(all_key, combine_maps[[3]], overlap = TRUE)
+
+} 
+
+# all_key <- merge(combo_map[[1]], combo_map[[2]], overlap=TRUE)
+# all_key <- merge(all_key, combo_map[[3]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[4]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[5]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[6]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[7]], overlap = TRUE)
+
+## key to map units from all predicted maps 
+rkey <- rkey %>% dplyr::select(x, model, map.response) %>% mutate(unit.update = x)
+convert <- c("X", "A", "W_t", "W", "Sc", "R", "F", "Non_veg","Wat", "Wb")
+    rkey <- rkey %>% mutate(unit.update = ifelse(unit.update %in% convert, "nonfor", unit.update))
+    setDT(rkey)[, map.response.new := .GRP, by = unit.update]
+## update key
+rkey_master <- fread("../PEM_standards_manuscripts/models/response_combo_bgcs_key_all.csv") %>% dplyr::select(x, model, map.response) %>% mutate(unit.update = x)
+    rkey_master <- rkey_master %>% mutate(unit.update = ifelse(unit.update %in% convert, "nonfor", unit.update))
+    setDT(rkey_master)[, map.response.new := .GRP, by = unit.update]
+
+    require(terra)
+all_key_sr <- terra::rast(all_key)
+writeRaster(all_key_sr, filename=file.path(out_dir, "allunit_combo_bgcs_renumbered_terra_raw.tif"))
+all_key_sr2 <- terra::subst(all_key_sr, rkey$map.response, rkey$map.response.new, filename=file.path(out_dir, "allunit_combo_bgcs_renumbered_terra.tif"), overwrite = TRUE)
+all_key_sr3 <- terra::subst(all_key_sr, rkey_master$map.response, rkey_master$map.response.new, filename=file.path(out_dir, "allunit_combo_bgcs_renumbered_terra2.tif"), overwrite = TRUE)
+fwrite(rkey, file.path(out_dir, "allunit_combo_bgcs_renumbered_terra_response_key.csv"))
+fwrite(rkey_master, file.path(out_dir, "allunit_combo_bgcs_renumbered_terra_response_key2.csv"))
+##
+
+### update raster values to match master key of all units
+
+# rkey_master2 <- left_join(rkey_master, rkey, by = 'x') %>% dplyr::select(x, map.response.x, map.response.y) %>% filter(!is.na(map.response.y)) %>%  distinct(.keep_all = TRUE) %>% data.frame
+ #raster::subs(all_key, rkey, by = 'map.response', which = 'map.response.new', filename=file.path(out_dir, "only_forest_combo_bgcs_renumbered.tif"), overwrite = TRUE)
+
+ ###for some reason terra does not keep all the correct response numbers - but is a lot faster
+
+# writeRaster(all_key, file.path(out_dir, "forest_combo_bgcs.tif"), overwrite = TRUE)
+# 
+# write.csv(rkey, file.path(out_dir, "response_combo_bgcs_key.csv"))
+
+```
+
+```{r clear cutblocks from all variable map }
+###currently using Patching in Qgis to replace cutblock NA with the DEM only map 
+cutblk <- st_read("../Deception_AOI/0_raw_inputs/base_layers/cleared_areas_atSentinelTime_updated.gpkg", quiet = TRUE)
+require(fasterize)
+cutblk_rast <- fasterize(aoi, all_key)
+#cutblk_rast [cutblk_rast  > 0] <- NA
+plot(cutblk_rast)
+all_map <- raster("../PEM_standards_manuscripts/models/paper_all_var/maps/forest_combo_bgcs_all.tif")
+
+all_key_masked <- mask(all_map,
+                               mask = cutblk_rast, inverse=TRUE)
+
+writeRaster(all_key_masked, "../PEM_standards_manuscripts/models/paper_all_var/maps/forest_combo_bgcs_masked.tif", overwrite = TRUE)
+
+```
+
+
+##Copied from other project and needs to be converted for use here
+
+```{r vectorize and decrumb raster map}
+###taken from BuildUSA script - need to use raster_to_polygon function 
+# Attribute hex grid with subzone/variant call
+source(here::here('_functions', '_raster_to_polygon.R'))
+##############link predicted Zones to Polygons and write shape file
+raster_to_polygon(all_key, clean_level = 3)
+
+###Dissolve 
+#hexZone <- st_read(dsn = "./outputs/WA_bgc_hex8000_ungrouped.gpkg")#, layer = "USA_bgc_hex_800m") ## need to read it back in to ensure all type Polygon is consistent
+temp3 <- hexZone
+temp3$BGC <- droplevels(temp3$BGC)
+temp3 <-  st_as_sf(temp3)# 
+st_precision(temp3) <- .5 
+temp3$BGC <- forcats::fct_explicit_na(temp3$BGC,na_level = "(None)")
+temp3 <- temp3[,c("BGC","Elevation","geom")]
+t2 <- aggregate(temp3[,-1], by = list(temp3$BGC), do_union = T, FUN = mean) %>% rename(BGC = Group.1)
+
+wna_boundary = st_read("D:/CommonTables/BC_AB_US_Shp/WNA_State_Boundaries.gpkg") %>% st_as_sf() %>% filter(State %in% region) %>%
+  st_transform( crs = st_crs(3005)) %>%
+  st_buffer(., dist = 0)# %>%
+ # as(., "Spatial")
+
+t2 <- st_zm(t2, drop=T, what='ZM') %>% st_transform(crs = st_crs(3005))  %>% st_buffer(0)
+t2 <- st_intersection(t2, wna_boundary)
+#mapView(t2)
+#CRS.102008 <- "+proj=aea +lat_1=20 +lat_2=60 +lat_0=40 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=m no_defs"
+#CRS.102218 <- "+proj=aea +lat_1=43 +lat_2=48 +lat_0=34 +lon_0=-120 +x_0=600000 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+
+#t3 <- st_transform_proj(t3, CRS.102218)
+#st_is_valid(t3)
+#t4 <- st_make_valid(t3)## this seems to remove rather than fix problem areas
+ st_write(t2, dsn = paste0("./outputs/", region, "_SubZoneMap_hex400_dissolved_5AprMay2022_clipped_BC.gpkg"), driver = "GPKG", delete_dsn = TRUE)
+ toc() ##WA takes approx 200s
+
+```
+
+```{r clean crumbs}
+## Read in map if not already loaded from previous chunk
+#region <- "WA"
+#t2 <- st_read(dsn = paste0("./outputs/", region, "_SubZoneMap_hex400_dissolved_7Jan2021_clipped.gpkg"))
+
+tic()
+t2a <- st_cast(t2, "MULTIPOLYGON") %>% st_cast("POLYGON")
+t2a <- t2a %>%
+  mutate(Area = st_area(.)) %>%
+  mutate(ID = seq_along(BGC))
+
+require (units)
+size <- 100
+size <- set_units(size, "m^2")
+tSmall <- t2a[t2a$Area <= size,]
+t2a$BGC <- as.character(t2a$BGC)
+toc()
+require(doParallel)
+coreNum <- as.numeric(detectCores()-1)
+coreNo <- makeCluster(coreNum)
+registerDoParallel(coreNo, cores = coreNum)
+
+###loop through each polygon < size, determine intersects, and assign to BGC with most edge touching
+###all the built in functions Kiri found only dealt with holes in the middle of polygons
+tic()
+new <- foreach(i = 1:length(tSmall$ID), .combine = rbind, .packages = c("foreach","sf")) %dopar% {
+  ID <- tSmall$ID[i]
+  nbrs <- st_intersects(tSmall[i,],t2a)[[1]]
+  nbrs <- nbrs[!nbrs %in% ID]
+  if(length(nbrs) == 0){return(NULL)}
+  lines <- st_intersection(t2a[ID,],t2a[nbrs,])
+  lines <- st_cast(lines)
+  l.len <- st_length(lines)
+  names(l.len) <- lines$BGC.1
+  zn <- names(l.len)[l.len == max(l.len)][1]
+  newDat <- t2a[ID,]
+  newDat$BGC <- zn
+  newDat
+}
+
+stopCluster(coreNo)
+gc()
+toc() ###approx 10 minutes
+
+tic()
+temp <- t2a[!t2a$ID %in% new$ID,]
+t2a <- rbind(temp, new) %>%
+  mutate(BGC = as.factor(BGC))
+#
+# ###now have to combine crumbs with existing large polygons
+temp2 <- t2a
+st_precision(temp2) <- 2
+t3 <- temp2 %>%
+  group_by(BGC) %>%
+  summarise(geom = sf::st_union(geometry)) %>%
+  ungroup()
+#
+#mapview(t2, zcol = "BGC")
+t3 <- st_zm(t3, drop=T, what='ZM')
+st_write(t3, dsn = paste0("./outputs/", region, "_BGC_5Apr2022_eliminated_BC.gpkg"), driver = "GPKG",delete_dsn = TRUE)
+toc()
+```
+
+
+```{r smooth}
+## smooth polygon boundaries
+tic()
+#t3_smooth <- smoothr::smooth(t3, method = "densify")
+t3_smooth <- smoothr::smooth(t3, method = "ksmooth", smoothness = 2)#)
+#t3_smooth.spline <- smoothr::smooth(t3_smooth, method = "spline")
+# holes = .5
+# area_thresh <- units::set_units(holes, km^2)
+# p_dropped <- smoothr::fill_holes(t3_smooth, threshold = area_thresh)
+# t3_smooth <- p_dropped
+#st_write(t3_smooth, dsn = paste0("./outputs/", region, "_BGC_19May2021_smoothed_densify-smooth.gpkg"), driver = "GPKG",delete_dsn = TRUE)
+st_write(t3_smooth, dsn = paste0("./outputs/", region, "_BGC_5Apr2022_smoothed.gpkg"), driver = "GPKG",delete_dsn = TRUE)
+toc()
+```
+
+
+# generate map for forest/non_forest split 
+
+```{r}
+# temp fix 
+
+# read in non-forest map generated at 5m accuracy
+nf_f <- file.path(out_dir, "forest_non_forest/for_nfor_all/2/for_nfor_all/predicted/")
+list.files(nf_f)
+
+
+# generate rasters for AOI 
+nf_f_map <- terra::rast(file.path(nf_f, "response.tif"))
+nf_f_key <- read.csv(file.path(nf_f, "response_names.csv"))
+
+nf_f_key <- nf_f_key %>% mutate(x = case_when(
+  x == "clearcut" ~ "forest", 
+  TRUE ~ as.character(.$x)))
+
+nf_f_key
+#  X         x
+# 1  clearcut
+# 2    forest
+# 3 nonforest
+# 4     water
+
+m <- c(1,2, 1)
+rclmat <- matrix(m, ncol=3, byrow=TRUE)
+forest_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+
+m <- c(4, 1)
+rclmat <- matrix(m, ncol=2, byrow=TRUE)
+water_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+
+m <- c(3, 1)
+rclmat <- matrix(m, ncol=2, byrow=TRUE)
+nf_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+
+
+##aoi_poly <- aoi %>% 
+#  st_as_sf(as_points = FALSE, merge = TRUE, na.rm = TRUE, use_integer = TRUE) %>%
+#  st_transform(3005) %>%
+#  left_join(aoi_key, by = c("response.tif" = "X"))
+
+
+```
+
+
+# generate the non-forest map and join to forested map
+
+```{r}
+# inorder to generate the non -forest model and join to the forested model we need to select the model of inerest : 
+
+# define 
+#- forest / non-forest mask model
+#- forested model
+#- non-forest model 
+
+# AOI <- "Deception"
+# #AOI <- "BoundaryTSA"
+# 
+# # set up file structure
+# AOI_dir <- file.path(".", paste0(AOI,"_AOI"))
+# out_dir <- file.path(AOI_dir, "3_maps_analysis","models")
+# shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+# 
+# fnf <- file.path(out_dir, "forest_non_forest", "for_nfor", "2")
+# f <- file.path(out_dir, "forest", "for_mu_bgc", "76")
+# nf <- file.path(out_dir, "non_forest","nf_class","2")
+# 
+# # read in non-forest and forest split
+# #nff_map <- stars::read_stars(file.path(fnf, "mosaic.tif"))
+# nff_map  <- raster(file.path(fnf, "mosaic.tif"))
+# nff_key <- read.csv(file.path(fnf, "response_names.csv"))
+# 
+# # read in non-forest map generated at 5m accuracy
+# nf_map <- raster(file.path(nf, "mosaic.tif"))
+# nf_key <- read.csv(file.path(nf, "response_names.csv"))
+# 
+# # crop to AOI and write out 
+# #all_key <- read_stars(file.path(map_dir, "mosaic.tif"))
+# #all_key <- st_crop(all_key, aoi)
+# #stars::write_stars(all_key, file.path(map_dir, "mosaic1.tif")) #tile name
+#        
+# 
+# 
+# 
+# aoi = st_read(file.path(shapes_dir, "AOI.gpkg")) %>%
+#   st_transform(3005) 
+# 
+# 
+# # crop to AOI and write out 
+# all_key <- read_stars(file.path(nf, "mosaic.tif"))
+# all_key <- st_crop(all_key, aoi)
+# stars::write_stars(all_key, file.path(map_dir, "mosaic_aoi.tif")) #tile name
+#     
+# 
+# ## Generate the non-forest mask 
+# #f_mask <- nff_map < 3
+# #w_mask <- nff_map == 3
+# 
+# nf_maks <- nff_map == 4 
+# 
+# nf_mask <- mask(nf_maks, as(aoi,'Spatial'))
+# nf_maskpoly <- st_as_sf(nf_mask)
+# 
+# 
+# 
+# 
+# 
+# nf_map_masked <- mask(nf_map, nf_mask) 
+# 
+# writeRaster(nf_mask, file.path(nf, "nf_filter.tif"), overwrite = TRUE)
+
+
+
+# m <- c(1,2, 1)
+# rclmat <- matrix(m, ncol=3, byrow=TRUE)
+# forest_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+# 
+# m <- c(4, 1)
+# rclmat <- matrix(m, ncol=2, byrow=TRUE)
+# water_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+# 
+# m <- c(3, 1)
+# rclmat <- matrix(m, ncol=2, byrow=TRUE)
+# nf_aoi <- terra::classify(aoi, rclmat, othersNA=TRUE, include.lowest=TRUE)
+
+
+
+
+
+
+
+```
+
+
+ 
+         
+

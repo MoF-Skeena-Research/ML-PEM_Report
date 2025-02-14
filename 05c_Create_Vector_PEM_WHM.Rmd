@@ -1,0 +1,208 @@
+---
+title: "05a_PEM_predict_map"
+author: "G. Perkins & W. MacKenzie"
+date: "06/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(dplyr)
+library(readxl)
+library(stringr)
+library(raster)
+library(stars)
+require(data.table)
+#install.packages("pemgeneratr")
+
+```
+
+This script to produce a  vector map from the final raster layer
+1. vectorize
+2. eliminate small polygons
+3. smooth?
+4. final response names to map codes
+5. generate qml for final map
+
+
+```{r set up folders, echo = FALSE}
+
+AOI <- "Deception"
+
+#AOI <- "DateCreek"
+
+
+#read in functions: 
+source(here::here('_functions', 'predict_map_tidy.R'))
+## folder with BGC random forest models
+outDir <- "../PEM_standards_manuscripts/models/paper_ss_all_var/rF_models"
+
+# set up file structure
+AOI_dir <- file.path("..", paste0(AOI,"_AOI"))
+cov_dir <- file.path(AOI_dir, "1_map_inputs", "covariates")
+shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+out_dir <- file.path(AOI_dir, "3_maps_analysis","models")
+out_dir <- file.path(AOI_dir, "models")
+input_pnts_dir <- file.path(AOI_dir, "1_map_inputs", "trainingData", "att_5m")
+bec_shp <- st_read(file.path(shapes_dir, "bec.gpkg"), quiet = TRUE)
+  
+# read in map and model keys
+map.key <-  read.csv("../PEM_standards_manuscripts/_MapUnitLegend/Deception_MapUnitLegend.csv", 
+                       stringsAsFactor = FALSE)
+#map.key <- read.csv(paste0(AOI_dir, "/_MapUnitLegend/", AOI, "_MapUnitLegend.csv"))
+
+model_param <- file.path("../PEM_standards_manuscripts/_MapUnitLegend/models_WHM.xlsx")
+
+# set up model parameters:  
+mparam <- read_xlsx(model_param, "models") %>% filter(to_run == 1)
+map_res <- mparam$resolution
+mname <- paste0(mparam$model_name)
+mrep <- mparam$model_rep
+
+# check which catergory of model to be produced
+mtype <- case_when(
+  str_detect(mname, "for_nf")  ~ "forest_non_forest",
+  str_detect(mname, "nf_") ~ "non_forest",
+  str_detect(mname, "fore") ~ "forest"
+)
+
+# get covariates for model
+mcov <- read_xlsx(model_param, "covariates", skip = 2) %>%
+  filter(!!sym(mparam$covariates) == 1) %>%
+  dplyr::select(covariate)
+
+
+```
+
+##Copied from other project and needs to be converted for use here
+
+```{r vectorize and decrumb raster map}
+###taken from BuildUSA script - need to use raster_to_polygon function 
+# Attribute hex grid with subzone/variant call
+source(here::here('_functions', '_raster_to_polygon.R'))
+##############link predicted Zones to Polygons and write shape file
+raster_to_polygon(all_key, clean_level = 3)
+
+###Dissolve 
+#hexZone <- st_read(dsn = "./outputs/WA_bgc_hex8000_ungrouped.gpkg")#, layer = "USA_bgc_hex_800m") ## need to read it back in to ensure all type Polygon is consistent
+temp3 <- hexZone
+temp3$BGC <- droplevels(temp3$BGC)
+temp3 <-  st_as_sf(temp3)# 
+st_precision(temp3) <- .5 
+temp3$BGC <- forcats::fct_explicit_na(temp3$BGC,na_level = "(None)")
+temp3 <- temp3[,c("BGC","Elevation","geom")]
+t2 <- aggregate(temp3[,-1], by = list(temp3$BGC), do_union = T, FUN = mean) %>% rename(BGC = Group.1)
+
+wna_boundary = st_read("D:/CommonTables/BC_AB_US_Shp/WNA_State_Boundaries.gpkg") %>% st_as_sf() %>% filter(State %in% region) %>%
+  st_transform( crs = st_crs(3005)) %>%
+  st_buffer(., dist = 0)# %>%
+ # as(., "Spatial")
+
+t2 <- st_zm(t2, drop=T, what='ZM') %>% st_transform(crs = st_crs(3005))  %>% st_buffer(0)
+t2 <- st_intersection(t2, wna_boundary)
+#mapView(t2)
+#CRS.102008 <- "+proj=aea +lat_1=20 +lat_2=60 +lat_0=40 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=m no_defs"
+#CRS.102218 <- "+proj=aea +lat_1=43 +lat_2=48 +lat_0=34 +lon_0=-120 +x_0=600000 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+
+#t3 <- st_transform_proj(t3, CRS.102218)
+#st_is_valid(t3)
+#t4 <- st_make_valid(t3)## this seems to remove rather than fix problem areas
+ st_write(t2, dsn = paste0("./outputs/", region, "_SubZoneMap_hex400_dissolved_5AprMay2022_clipped_BC.gpkg"), driver = "GPKG", delete_dsn = TRUE)
+ toc() ##WA takes approx 200s
+
+```
+
+```{r simplify vector map}
+require(terra)
+require(rmapshaper)
+require(tictoc)
+PEM_map <- read_sf("C:/Users/whmacken/OneDrive - Government of BC/PEM/maps/Deception_mergedAllCVar_27July2022_sieved4.gpkg")
+tic()
+PEM_map2 <-  rmapshaper::ms_simplify(PEM_map, keep = 0.1, method = 'vis', weighting = 0.7, explode = FALSE, sys = TRUE)
+toc()
+PEM_map3 <-  rmapshaper::ms_dissolve(PEM_map2, field = "response_combo_bcgs_key_all_x", sys = TRUE)
+st_write(PEM_map3, "C:/Users/whmacken/OneDrive - Government of BC/PEM/maps/Deception_mergedAllCVar_27July2022_simplified_dissolved2.gpkg", append = FALSE)
+```
+
+```{r clean crumbs}
+## Read in map if not already loaded from previous chunk
+#region <- "WA"
+#t2 <- st_read(dsn = paste0("./outputs/", region, "_SubZoneMap_hex400_dissolved_7Jan2021_clipped.gpkg"))
+
+tic()
+t2a <- st_cast(t2, "MULTIPOLYGON") %>% st_cast("POLYGON")
+t2a <- t2a %>%
+  mutate(Area = st_area(.)) %>%
+  mutate(ID = seq_along(BGC))
+
+require (units)
+size <- 100
+size <- set_units(size, "m^2")
+tSmall <- t2a[t2a$Area <= size,]
+t2a$BGC <- as.character(t2a$BGC)
+toc()
+require(doParallel)
+coreNum <- as.numeric(detectCores()-1)
+coreNo <- makeCluster(coreNum)
+registerDoParallel(coreNo, cores = coreNum)
+
+###loop through each polygon < size, determine intersects, and assign to BGC with most edge touching
+###all the built in functions Kiri found only dealt with holes in the middle of polygons
+tic()
+new <- foreach(i = 1:length(tSmall$ID), .combine = rbind, .packages = c("foreach","sf")) %dopar% {
+  ID <- tSmall$ID[i]
+  nbrs <- st_intersects(tSmall[i,],t2a)[[1]]
+  nbrs <- nbrs[!nbrs %in% ID]
+  if(length(nbrs) == 0){return(NULL)}
+  lines <- st_intersection(t2a[ID,],t2a[nbrs,])
+  lines <- st_cast(lines)
+  l.len <- st_length(lines)
+  names(l.len) <- lines$BGC.1
+  zn <- names(l.len)[l.len == max(l.len)][1]
+  newDat <- t2a[ID,]
+  newDat$BGC <- zn
+  newDat
+}
+
+stopCluster(coreNo)
+gc()
+toc() ###approx 10 minutes
+
+tic()
+temp <- t2a[!t2a$ID %in% new$ID,]
+t2a <- rbind(temp, new) %>%
+  mutate(BGC = as.factor(BGC))
+#
+# ###now have to combine crumbs with existing large polygons
+temp2 <- t2a
+st_precision(temp2) <- 2
+t3 <- temp2 %>%
+  group_by(BGC) %>%
+  summarise(geom = sf::st_union(geometry)) %>%
+  ungroup()
+#
+#mapview(t2, zcol = "BGC")
+t3 <- st_zm(t3, drop=T, what='ZM')
+st_write(t3, dsn = paste0("./outputs/", region, "_BGC_5Apr2022_eliminated_BC.gpkg"), driver = "GPKG",delete_dsn = TRUE)
+toc()
+```
+
+
+```{r smooth}
+## smooth polygon boundaries
+tic()
+#t3_smooth <- smoothr::smooth(t3, method = "densify")
+t3_smooth <- smoothr::smooth(t3, method = "ksmooth", smoothness = 2)#)
+#t3_smooth.spline <- smoothr::smooth(t3_smooth, method = "spline")
+# holes = .5
+# area_thresh <- units::set_units(holes, km^2)
+# p_dropped <- smoothr::fill_holes(t3_smooth, threshold = area_thresh)
+# t3_smooth <- p_dropped
+#st_write(t3_smooth, dsn = paste0("./outputs/", region, "_BGC_19May2021_smoothed_densify-smooth.gpkg"), driver = "GPKG",delete_dsn = TRUE)
+st_write(t3_smooth, dsn = paste0("./outputs/", region, "_BGC_5Apr2022_smoothed.gpkg"), driver = "GPKG",delete_dsn = TRUE)
+toc()
+```
+
+

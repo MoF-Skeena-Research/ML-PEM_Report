@@ -1,0 +1,179 @@
+---
+title: "05_build_map"
+author: "W.H.MacKenzie"
+date: "2023-03-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r  libraries}
+#remotes::install_github("bcgov/PEMprepr", build_vignettes = TRUE)
+devtools::load_all("D:\\GitHub\\PEMprepr")
+devtools::load_all("D:\\GitHub\\PEMmodelr")
+
+library(PEMprepr)
+library(PEMmodelr)
+library(terra)
+library(tidyterra)
+
+fid <- setup_folders("Deception_AOI")
+
+```
+
+
+```{r build tiles}
+
+model_dir <- file.path(fid$model_final[2])
+bec_zones <- as.list(list.files(model_dir))
+
+covdir <- fid$cov_dir_1020[2]
+res_folder = "5m"
+
+# select reduced variables
+reduced_vars <- read.csv(file.path(fid$model_inputs0310[2],  "reduced_covariate_list_dem_only.csv")) %>% pull()
+
+# get full raster list 
+rast_list <- list.files(file.path(covdir, res_folder), pattern = ".tif$", full.names = TRUE)
+rast_list <- rast_list[tolower(gsub(".tif", "", basename(rast_list))) %in% (reduced_vars)]
+rstack <- terra::rast(rast_list)
+template <- terra::rast(rast_list[2])
+# generate tiles for mapping 
+
+tile_dir <- file.path(model_dir, "tiles")
+
+if(!dir.exists(file.path(tile_dir))){
+  dir.create(file.path(tile_dir)) 
+  # make tiles (might want to make NA tile )
+  ntiles <- makeTiles(template, 600, filename= file.path(tile_dir, "tile_.tif"),  na.rm=FALSE, overwrite = TRUE)
+}else if(dir.exists(file.path(tile_dir))){
+  ntiles <- list.files(tile_dir, full.names = T)
+}
+
+
+# for each bec zone
+bgcs <- list.dirs(model_dir, recursive = F,full.names = FALSE)
+bgcs <- gsub("tiles", '', bgcs)
+
+```
+
+# loop through the bgcs 
+
+```{r}
+require(tictoc)
+tic()
+map_bgc <- for(b in bgcs){
+  
+  #b = bgcs[3]
+  
+  mfit = list.files(file.path(model_dir, b), recursive = TRUE, pattern = "final_modeloverall_dem.rds", full.names = T)
+  # mfit = mfiles[1]
+  model <- readRDS(file.path(mfit))
+  # make the output dir
+  
+  out_dir <- file.path(model_dir, b,"map")
+  # check if out_dir exists
+  if(!dir.exists(file.path(out_dir))){ dir.create(file.path(out_dir))}
+  
+  predict_map(model, out_dir, tile_size = 600, tile_dir, rstack, probability = FALSE)
+   
+} 
+toc()
+
+# readRDS(file.path(model_dir, "ESSFmc","final_modeloverall_dem.rds")) %>% #workflows::pull_workflow_fit() %>% 
+#    workflows::extract_fit_parsnip() %>%  vip::vip()
+```
+Merge mapunit keys
+
+```{r merge mapunits modelled}
+model_dir <- file.path(fid$model_final[2])
+bec_shp <- st_read(file.path(fid$shape_dir_1010[2],"bec.gpkg"), quiet = TRUE)%>%
+   dplyr::select(MAP_LABEL)
+aoi <- st_read(file.path(fid$shape_dir_1010[2], "AOI.gpkg"), quiet = TRUE)
+map.key  <- read.csv(file.path(fid$model_inputs0310[2], "Deception_MapUnitLegend.csv"), stringsAsFactor = FALSE)
+folders <- as.list(c("ESSFmc", "ESSFmcw", "SBSmc2")) 
+
+folders <- as.list(c("ESSFmc", "ESSFmcw", "SBSmc2")) 
+# step 1:  set up a key for the combined map (includes all the units)
+rkey <- lapply(folders, function (f){
+  
+  keys <- read.csv(file.path(model_dir, f, "map", "response_names.csv")) %>%
+    mutate(model  = f)
+})
+
+rkey <- do.call("rbind", rkey)
+rkey <- rkey %>% dplyr::mutate(map.response = seq(1:length(X)))
+
+```
+
+Merge the maps together 
+```{r merge maps}
+combo_map <- lapply(folders, function(f){
+  
+  # f <- folders[[1]]
+  
+  rtemp <- rast(file.path(model_dir, f, "map", "mosaic.tif"))
+  
+  rtemp[is.na(rtemp[])] <- 0 
+  
+  # filter to only predict over bgc
+  bec_filter <- bec_shp %>%
+    filter(MAP_LABEL == f) %>%
+    dplyr::select(MAP_LABEL) 
+  
+  rtemp <- terra::mask(rtemp, bec_filter)
+  
+  subkey <- rkey %>% dplyr::filter(model == f) %>%
+    mutate(mosaic = as.numeric(rownames(.)))
+  
+  # check if the key matches or needs reclassification 
+  if (isTRUE(unique(subkey$mosaic == subkey$map.response))) {
+    
+    print("matching key")
+    
+  } else {
+    
+    print("updating key")
+    
+    m <- subkey %>%
+      mutate(to = as.numeric(X), 
+             from = as.numeric(X)+1) %>%
+      dplyr::select(to, from, map.response) 
+    
+    reclm <-  as.matrix(m, ncol=3, byrow= TRUE)
+    rtemp <-  terra::classify(rtemp, reclm, right = FALSE)#, include.lowest=TRUE)
+    
+  }
+  
+  rtemp <- terra::classify(rtemp, cbind(-Inf, 0, NA), include.lowest=TRUE)
+  rtemp
+  
+})
+
+
+# join all the maps together
+
+if(length(folders) == 3) {
+  
+  all_map <- merge(combo_map[[1]], combo_map[[2]], combo_map[[3]])
+ 
+} 
+
+# all_key <- merge(combo_map[[1]], combo_map[[2]], overlap=TRUE)
+# all_key <- merge(all_key, combo_map[[3]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[4]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[5]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[6]], overlap = TRUE)
+# all_key <- merge(all_key, combo_map[[7]], overlap = TRUE)
+
+# tidy key and output maps
+rkey <- rkey %>% dplyr::select(map.response, model, X, .pred_class)
+
+terra::writeRaster(all_map, filename = file.path(fid$map_raster_0041[2], "all_combo_bgcs_dem.tif"), overwrite = TRUE)
+
+write.csv(rkey, file.path(fid$map_raster_0041[2], "response_combo_bcgs_key.csv"), row.names = FALSE)
+```
+```

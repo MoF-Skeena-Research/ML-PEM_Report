@@ -1,0 +1,823 @@
+---
+title: "Testing accuracy using different number of slices"
+output: html_document
+
+
+---
+
+```{r setup options, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=FALSE,
+                      warning = FALSE, message = FALSE,
+                      results = 'show',
+                      options(dplyr.summarise.inform = FALSE),
+                      eval = TRUE)  ## flag eval = false for quick text edits
+```
+
+## Testing iterations of training and testing combinations
+
+For new study areas there is a structure of slices sites (ie 5 sites per slice). This enables a bootstrap approach to accuracy measures which holds one slice out of model build and uses it for accuracy measures. 
+
+This is then repeated for each slice with the results averaged to provide confidence levels. 
+
+We tested the loop per site also but found this also generated very large confidence ranges due to individual 
+
+An aspect of this to test is the impact of holding out consecutive amounts of data. 
+
+
+1 vs 2
+1 vs 2, 3
+1 vs 2, 3, 4
+1 vs 2, 3, 4, 5
+
+...continue for the rest of the loops 
+
+The accuracy metrics were adjusted so all results included the full set of unique site series for a given bgc. This ensured comparisons were equal across all slices and that we could assess accuracy of map accuracy when additional slices were added. 
+
+
+
+**considerations/questions**
+
+- where slice is unbalanced? 
+- where not full slice. need to account for weighting  
+
+
+```{r setup, include=FALSE, warning = FALSE, message = FALSE}
+library(data.table)
+library(scales)
+library(cowplot)
+library(sf)
+library(tidyverse)
+library(fasterize)
+library(stringr)
+library(dplyr)
+library(raster)
+library(readxl)
+library(stars)
+library(foreach)
+library(tidymodels)
+library(themis)
+library(vip)
+require(stringi)
+require(R.utils)
+#library(knitr)
+library(ggplot2)
+library(gridExtra)
+library(janitor)
+require(utils)
+library(colorspace)
+require(ggpubr)
+
+```
+
+```{r session setup, tidy = TRUE, warning=FALSE, echo = FALSE}
+AOI <- "Deception"
+AOI_dir <- file.path(paste0("../", AOI,"_AOI"))
+#AOI_dir <- file.path(paste0( AOI,"_AOI"))
+cov_dir <- file.path(AOI_dir, "1_map_inputs", "covariates")
+shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+input_pnts_dir <- file.path(AOI_dir, "1_map_inputs", "trainingData")
+out_dir <- file.path(AOI_dir, "3_maps_analysis","models")
+results_dir <- file.path(AOI_dir, "results")
+
+#onedrive <- "C:/Users/genperk/OneDrive - Government of BC/PEM_DATA/_data_sharing/PEM_standards_manuscript/"
+onedrive <- "F:/OneDrive - Government of BC/PEM_DATA/_data_sharing/PEM_standards_manuscript/"
+#onedrive <- "C:/Users/whmacken/OneDrive - Government of BC/PEM_DATA/_data_sharing/PEM_standards_manuscript/"
+# read in temp functions
+
+source(here::here('_functions', 'point_subsample.R'))
+source(here::here('_functions', 'model_gen_tidy.R'))
+source(here::here('_functions', 'acc_metrix_LOO_WHM.R'))
+source(here::here('_functions', 'doc_theme_pem.R'))
+source(here::here('_functions', 'plot_helper.R'))
+
+# read in map and model keys
+map.key  <- read.csv("../PEM_standards_manuscripts/_MapUnitLegend/Deception_MapUnitLegend.csv", 
+                       stringsAsFactor = FALSE)
+# #read in the fuzzy index
+fMat <- read.csv("../PEM_standards_manuscripts/_MapUnitLegend/fuzzy_matrix_basic_updated.csv") %>%
+  dplyr::select(c(target, Pred, fVal)) %>% distinct ()
+
+# read in prepped data 
+#tpts <- read.csv(file.path(onedrive,"loo","s1_clean_pts_all_fnf.csv")) 
+
+
+```
+
+
+```{r build comparison matrix eval = FALSE, echo = FALSE}
+
+# bgcoi_string <- "essfmc_" 
+# bgcoi <- "ESSFmc"
+# 
+# bgcoi_string <- "essfmcw" 
+# bgcoi <-"ESSFmcw"
+# 
+# bgcoi_string <- "sbsmc2"
+# bgcoi <- "SBSmc2"
+# 
+# 
+# trDat <- tpts %>%
+#   filter(str_detect(tid, bgcoi_string)) %>% # need to adjust this
+#   mutate(slice = as.factor(slice)) %>%
+#   dplyr::select(-bgc_cat)
+# 
+# # set up the slices
+# slices <- unique(trDat$slice) %>% droplevels()
+# slices2 <- as.character(slices)
+# 
+# # build comparison table: 
+# 
+# if(bgcoi == "ESSFmcw"){
+#   
+# allcompare <- expand.grid(V1 = slices2, V2 = slices2) %>%
+#   filter(V1 != V2)#500
+# 
+# allcomp_order <- allcompare %>%
+#   rowwise() %>%
+#   mutate(train = list(sort(c(V2))))
+#   
+# xy <- allcomp_order %>% mutate(V2min = train[1])%>%
+#   ungroup()%>%
+#   dplyr::select(-c(train,V2)) %>%
+#   distinct() %>%
+#   rename("V2" = V2min)
+# 
+# allcomp <- xy
+# 
+# allcomp <- allcomp %>%
+#   mutate(slice_no = (length(slices)-1) - (rowSums(is.na(.)))) %>%
+#   mutate(slice = rownames(.))
+# 
+# allcomp_essfmcm = allcomp
+# 
+# #write.csv(allcomp_essfmcm, file = paste0(AOI_dir, "/results/num_slice_acc/", bgcoi, "matrix.csv"))
+# #write.csv(allcomp_essfmcm, file = paste0(onedrive,"loo/", bgcoi, "matrix.csv"))
+# 
+# fwrite(allcomp_essfmcm, file = file.path(AOI_dir, "results","num_slice_acc", paste0(bgcoi, "matrix.csv")))
+# fwrite(allcomp_essfmcm, file = file.path(onedrive,"loo", paste0(bgcoi, "matrix.csv")))
+# } 
+# 
+# if(bgcoi == "ESSFmc"){
+#   
+# allcompare2 <- expand.grid(V1 = slices2, V2 = slices2) %>% filter(V1 != V2) #20
+# allcompare3 <- expand.grid(V1 = slices2, V2 = slices2, V3 = slices2) %>% #125
+#   filter(V1 != V2) %>% #100
+#   filter(V1 != V3) %>% #80
+#   filter(V2 != V3) # 60
+# 
+# allcompare4 <- expand.grid(V1 = slices2, V2 = slices2, V3 = slices2, V4 = slices2) %>% #625
+#   filter(V1 != V2) %>% #500
+#   filter(V1 != V3) %>% #400
+#   filter(V1 != V4) %>% # 320
+#   filter(V2 != V3) %>% #240
+#   filter(V2 != V4) %>%#180
+#   filter(V3 !=V4) # 120
+# 
+# allcompare5 <- expand.grid(V1 = slices2, V2 = slices2, V3 = slices2, V4 = slices2, V5 = slices2) %>% #625
+#   filter(V1 != V2) %>% #500
+#   filter(V1 != V3) %>% #400
+#   filter(V1 != V4) %>% # 320
+#   filter(V1 != V5) %>%
+#   filter(V2 != V3) %>% #240
+#   filter(V2 != V4) %>%#180
+#   filter(V2 != V5) %>%#180
+#   filter(V3 !=V4)  %>%# 120
+#   filter(V3 !=V5)  %>%# 120
+#   filter(V4 !=V5) # 120
+# 
+# # for ESSFmc2 (slices x 6)
+# allcompare6 <- expand.grid(V1 = slices2, V2 = slices2, V3 = slices2, V4 = slices2, V5 = slices2, V6 = slices2) %>% #625
+#   filter(V1 != V2) %>% #500
+#   filter(V1 != V3) %>% #400
+#   filter(V1 != V4) %>% # 320
+#   filter(V1 != V5) %>%
+#   filter(V1 != V6) %>% 
+#   filter(V2 != V3) %>% #240
+#   filter(V2 != V4) %>%#180
+#   filter(V2 != V5) %>%#180
+#   filter(V2 != V6) %>%#180
+#   filter(V3 !=V4)  %>%# 120
+#   filter(V3 !=V5)  %>%# 120
+#   filter(V3 !=V6)  %>%# 120
+#   filter(V4 !=V5) %>%# 120  
+#   filter(V4 !=V6) %>%# 120
+#   filter(V5 !=V6)# 120
+# 
+# allcomp <- bind_rows(allcompare6, allcompare5, allcompare4, allcompare3, allcompare2)
+# 
+# allcomp_order <- allcomp %>%
+#   rowwise() %>%
+#   mutate(train = list(sort(c(V2, V3, V4, V5, V6))))
+# 
+# xy <- allcomp_order %>% mutate(V2min = train[1],
+#                                V3min = train[2],
+#                                V4min = train[3],
+#                                V5min = train[4],
+#                                V6min = train[5]) %>%
+#   ungroup()%>%
+#   dplyr::select(-c(train,V2,V3,V4,V5, V6)) %>%
+#   distinct() %>%
+#   rename("V2" = V2min, 
+#          "V3" = V3min,
+#          "V4" = V4min, 
+#          "V5" = V5min,
+#          "V6" = V6min) #%>%
+#   #mutate(slice_no = 4 - (rowSums(is.na(.))))
+# 
+# allcomp <- xy
+# 
+# allcomp <- allcomp %>%
+#   mutate(slice_no = (length(slices)-1) - (rowSums(is.na(.)))) %>%
+#   mutate(slice = rownames(.))
+# 
+# allcomp_essfmc = allcomp
+# 
+# #write.csv(allcomp_essfmc, file = paste0(AOI_dir, "/results/num_slice_acc/", bgcoi, "matrix.csv"))
+# #write.csv(allcomp_essfmc, file = paste0(onedrive,"loo/", bgcoi, "matrix.csv"))
+# 
+# fwrite(allcomp_essfmc, file = file.path(AOI_dir, "results","num_slice_acc", paste0(bgcoi, "matrix.csv")))
+# fwrite(allcomp_essfmc, file = file.path(onedrive,"loo", paste0(bgcoi, "matrix.csv")))
+# 
+# } 
+# 
+# if(bgcoi == "SBSmc2"){
+#   
+# allcompare2 <- expand.grid(V1 = slices2, V2 = slices2) %>% filter(V1 != V2) #20
+# allcompare3 <- expand.grid(V1 = slices2, V2 = slices2, V3 = slices2) %>% #125
+#   filter(V1 != V2) %>% #100
+#   filter(V1 != V3) %>% #80
+#   filter(V2 != V3) # 60
+# 
+# allcompare4 <- expand.grid(V1 = slices2, V2 = slices2, V3 = slices2, V4 = slices2) %>% #625
+#   filter(V1 != V2) %>% #500
+#   filter(V1 != V3) %>% #400
+#   filter(V1 != V4) %>% # 320
+#   filter(V2 != V3) %>% #240
+#   filter(V2 != V4) %>%#180
+#   filter(V3 !=V4) # 120
+# 
+# allcompare5 <- expand.grid(V1 = slices2, V2 = slices2, V3 = slices2, V4 = slices2, V5 = slices2) %>% #625
+#   filter(V1 != V2) %>% #500
+#   filter(V1 != V3) %>% #400
+#   filter(V1 != V4) %>% # 320
+#   filter(V1 != V5) %>%
+#   filter(V2 != V3) %>% #240
+#   filter(V2 != V4) %>%#180
+#   filter(V2 != V5) %>%#180
+#   filter(V3 !=V4)  %>%# 120
+#   filter(V3 !=V5)  %>%# 120
+#   filter(V4 !=V5) # 120
+# 
+# allcomp <- bind_rows( allcompare5, allcompare4, allcompare3, allcompare2)
+# 
+# allcomp_order <- allcomp %>%
+#   rowwise() %>%
+#   mutate(train = list(sort(c(V2, V3, V4, V5))))
+# 
+# xy <- allcomp_order %>% mutate(V2min = train[1],
+#                                V3min = train[2],
+#                                V4min = train[3],
+#                                V5min = train[4]) %>%
+#   ungroup()%>%
+#   dplyr::select(-c(train,V2,V3,V4,V5)) %>%
+#   distinct() %>%
+#   rename("V2" = V2min, 
+#          "V3" = V3min,
+#          "V4" = V4min, 
+#          "V5" = V5min) 
+# 
+# allcomp <- xy
+# 
+# allcomp <- allcomp %>%
+#   mutate(slice_no = (length(slices)-1) - (rowSums(is.na(.)))) %>%
+#   mutate(slice = rownames(.))
+# 
+# allcomp_sbsmc = allcomp
+# #write.csv(allcomp_sbsmc, file = paste0(AOI_dir, "/results/num_slice_acc/", bgcoi, "matrix.csv"))
+# #write.csv(allcomp_sbsmc, file = paste0(onedrive,"loo/", bgcoi, "matrix.csv"))
+# 
+# fwrite(allcomp_sbsmc, file = file.path(AOI_dir, "results","num_slice_acc", paste0(bgcoi, "matrix.csv")))
+# fwrite(allcomp_sbsmc, file = paste0(onedrive,"/loo/", bgcoi, "matrix.csv"))
+# }
+#  
+```
+
+**List of combinations** 
+
+In the test below I tested 75 combinations of test and training split and ran a basic model (no smoting and no downsampling)
+
+The list below shows the combinations of test slice (V1) and training slices (V2:V5). The row number is used to identify which combination was tested. 
+For example row 7 = slice 1 (test), slices 2& 3 (training)
+
+Note in this testing I only used a maximum of 1 slice for testing. 
+
+```{r builds model iteratively by slice_no, echo = FALSE, eval = FALSE}
+# get unique ss for the given variant 
+
+##NEED TO BRING IN TRDAT FROM Balancing script**************************
+
+allcomp <- fread("../Deception_AOI/results/num_slice_acc/SBSmc2matrix.csv")
+default.unit = "SBSmc2_01"
+allcomp <- fread("../Deception_AOI/results/num_slice_acc/ESSFmcwmatrix.csv")
+default.unit = "ESSFmcw_101"
+allcomp <- fread("../Deception_AOI/results/num_slice_acc/ESSFmcmatrix.csv")
+default.unit = "ESSFmc_01"
+
+
+
+  convert <- c("X", "A", "W_t", "W", "Sc", "R", "F", "Non_veg","Wat", "Wb")
+    map.units <- trDat_centre %>% mutate(target = ifelse(target %in% convert, "nonfor", as.character(target))) %>% 
+      mutate_if(is.character, as.factor)
+  ###harmonize levels
+  map.lev <- levels(map.units$target)
+
+sresults <- foreach(k = 1:nrow(allcomp)) %do% {
+
+  k <- 2
+  bgc2 <- unique(trDat_centre$bgc_cat)
+  ### split into train and test based on 5-site slices
+  train_slice <- allcomp[k,2:(length(allcomp)-2)] %>% droplevels() %>% t()
+  test_slice <- allcomp[k,1] %>% droplevels()%>% t()
+  
+  reduced.var <- fread("../PEM_standards_manuscripts/models/paper_all_var/ESSFmc/rfe_variables.csv", 
+                       stringsAsFactor = FALSE)
+reduced.var <- reduced.var$.
+  trDat_centre2  <- trDat_centre  %>% dplyr::select(target, target2, slice, all_of(reduced.var)) %>%
+      mutate(slice = as.factor(slice)) 
+  # training set
+  BGC_train <- trDat_centre2 %>% dplyr::filter(slice %in% train_slice) 
+  BGC_train_all <- BGC_train 
+  BGC_train <- BGC_train %>%
+    dplyr::select(-slice, -target2) %>%
+    droplevels()
+
+  # test set - for baseline accuracy
+  BGC_test <- trDat_centre2 %>% filter(slice %in% test_slice) 
+  BGC_test_all <- BGC_test # keep for the target2 alt call. 
+  BGC_test_transect_no <- length(unique(BGC_test_all$transect_id))
+  BGC_test <- BGC_test %>%
+    dplyr::select(-slice, -target2) %>%
+    droplevels()
+  ## test set - for spatially adjacent cells
+  ###HERE WE SHOULD PULL IN BOUNDARY BLOCKS FOR EACH TRANSECT. A RASTER STACK OF COVARIATES FOR THE BLOCK AROUND EACH TRANSECT TO BE CREATED IN THE INITIAL SETUP SCRIPTS
+  ### PREDICT THE BOUNDED BLOCK
+  
+  # ############### Define test recipes and workflow ###################
+  
+  null_recipe <-
+    recipe(target ~ ., data = BGC_train) %>%
+    #update_role(tid, new_role = "id variable") %>%
+    #step_downsample(target, under_ratio = 25) %>%
+    #step_smote(target, over_ratio = .75, neighbors = 2, skip = TRUE) %>% #, over_ratio = 1, neighbors = 2) %>%
+    prep()
+
+    randf_spec <- rand_forest(mtry = 23, min_n = 6, trees = 151) %>%
+
+    set_mode("classification") %>%
+    set_engine("ranger", importance = "permutation", verbose = FALSE)
+
+  pem_workflow <- workflow() %>%
+    add_recipe(null_recipe) %>%
+    add_model(randf_spec)
+
+ ## build final train model and predict test data and compare acc_metrix to cv result
+  PEM_rf1 <- fit(pem_workflow, BGC_train)
+
+  #final_fit <- pull_workflow_fit(PEM_rf1)# %>%pull(.predictions)
+  final_fit <- extract_fit_parsnip(PEM_rf1)
+
+ # oob  <- round(PEM_rf1$fit$fit$fit$prediction.error, 3)
+  
+  ######### Predict Test of Transects
+  #test_target <- as.data.frame(BGC_test$target) %>% rename(target = 1)
+  test_target <- BGC_test_all %>% dplyr::select(target)
+
+  test.pred <-  predict(PEM_rf1, BGC_test)
+  test.pred <- cbind(test_target, test.pred) %>% 
+    mutate_if(is.character, as.factor)
+  # levels(train.pred$target)
+  
+  ###harmonize levels
+  targ.lev <- levels(test.pred$target)
+  pred.lev <- levels(test.pred$.pred_class)
+  levs <- c(targ.lev, pred.lev) %>% unique()
+  test.pred$target <- factor(test.pred$target, levels = levs)
+  test.pred$.pred_class <- factor(test.pred$.pred_class, levels = levs)
+    test.pred <- test.pred %>%  mutate_if(is.factor, as.character)
+  
+  convert <- c("X", "A", "W_t", "W", "Sc", "R", "F", "Non_veg","Wat", "Wb")
+    
+    test.pred <- test.pred %>% mutate(target = ifelse(target %in% convert, "nonfor", target),
+                                  .pred_class = ifelse(.pred_class  %in% convert, "nonfor", .pred_class )) 
+    
+    test.pred <- test.pred %>%  mutate_all(as.factor)
+    
+  targ.lev <- levels(test.pred$target)
+  pred.lev <- levels(test.pred$.pred_class)
+  levs <- c(targ.lev, pred.lev) %>% unique()
+  missed.units <- setdiff(map.lev, levs) %>% data.frame %>% rename(target = 1) %>% 
+    mutate( .pred_class = default.unit) %>% data.frame %>% mutate_if(is.character, as.factor)##id = row_number(), target2 = default.unit,
+  test.pred <- rbind(test.pred,missed.units)# %>% mutate(id = row_number())
+  # output test predictions
+  test.pred.out <- test.pred %>% mutate(slice = k)
+    targ.lev <- levels(test.pred$target)
+  pred.lev <- levels(test.pred$.pred_class)
+  levs <- c(targ.lev, pred.lev) %>% unique()
+  test.pred$target <- factor(test.pred$target, levels = levs)
+  test.pred$.pred_class <- factor(test.pred$.pred_class, levels = levs)
+    test.pred <- test.pred %>%  mutate_if(is.character, as.factor)
+    acc <- test.pred %>% accuracy(target, target2, .pred_class, na_rm = TRUE)  %>%  dplyr::select(.estimate) %>% as.numeric %>% round(3)
+   
+  # train.acc <- acc_metrix(train.pred) %>% rename(train = .estimate)
+  test.acc <- acc_metrix(test.pred) %>%
+       mutate(slice = k, 
+           transect_no = BGC_test_transect_no,
+           acc_type = "test_estimate", 
+           #oob = oob
+           )
+  
+ test.acc$bgc <- bgc2
+   ## compare cv stats to test stats
+  acc.compare <- test.acc
+  
+    ### THEN PREDICT THE BOUNDING BOX FOR EACH RASTER AND RUN AN ADJACENCY FUNCTION TO LOOK FOR MATCHES WITH QUEENS CASE ADJACENT CELLS AND RETURN THE FUZZY SPATIAL STATS USING SPADES::ADJ FUNCTION
+
+  return(list(acc.compare, test.pred.out))
+}
+
+
+# extract results from sresults
+pred_matrix <- lapply(sresults, function(x) x[[2]])
+acc_results <- lapply(sresults, function(x) x[[1]])
+
+acc <- as.data.frame(rbindlist(acc_results)) %>% mutate(slice = as.factor(slice)) 
+
+allcompmatrix <- allcomp %>%
+  mutate(slice = as.factor(slice))
+
+tests <- allcompmatrix %>% dplyr::select(slice, slice_no)
+acc <- left_join(acc,tests, by = "slice")
+
+test.pred <- as.data.frame(rbindlist(pred_matrix)) 
+
+
+#write.csv(acc, file = paste0(AOI_dir, "/results/num_slice_acc/", bgcoi, "acc_results_", "test" , ".csv"))
+#write.csv(acc, file = paste0(onedrive,"loo/", bgcoi, "acc_results_", "test" , ".csv"))
+fname = paste0(bgc2, "acc_results.csv")
+fwrite(acc, file.path("../PEM_standards_manuscripts/outputs/num_slice_acc", paste0(bgc2, "acc_results.csv"))) 
+#write.csv(acc, file = file.path(onedrive,"loo", paste0(bgcoi, "acc_results.csv")))
+
+## write out for balanced dataset
+
+#write.csv(acc, file = paste0("../",AOI_dir, "/results/num_slice_acc/", bgcoi, "acc_results_balance_", "test2" , ".csv"))
+
+#write.csv(acc, file = paste0(onedrive,"loo/", bgcoi, "acc_results_balance_", "test2" , ".csv"))
+
+#}
+
+```
+
+```{r}
+acc <- fread("../PEM_standards_manuscripts/outputs/num_slice_acc/ESSFmcacc_results.csv")
+acc2 <- fread("../PEM_standards_manuscripts/outputs/num_slice_acc/SBSmc2acc_results.csv")
+acc <- rbind(acc, acc2)
+
+acc <- acc %>%    dplyr::select(bgc,slice_no, slice, spat_p_theta1,spat_p_theta.5, spat_p_theta0, aspat_p_theta1,aspat_p_theta.5, aspat_p_theta0 ) %>% 
+  distinct%>% 
+  mutate(slice = factor(slice), bgc = factor(bgc), slice_no = factor(slice_no))
+
+   acc2 <- acc  %>%
+   pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+     distinct() %>% 
+       mutate(type = case_when(
+       accuracy_type %in% c("MLaccuracy", "OOB_inv",  "kappa", "mcc") ~ "0_machine",
+      str_detect(accuracy_type, "^spat_p_theta") ~ "1_spatial",
+      str_detect(accuracy_type, "aspat_p_theta") ~ "2_aspatial")) %>% 
+     filter(!is.na(type)) %>% filter(!accuracy_type == "slice") %>% 
+     mutate(accuracy_type = str_replace(accuracy_type, "aspat_p_theta_", "\u0398 "),
+       accuracy_type = str_replace(accuracy_type, "^spat_p_theta_", "\u0398 ")) %>% 
+     mutate(accuracy_type = factor(accuracy_type), type = factor(type))#,
+       # accuracy_type = str_replace(accuracy_type, "spat_p_theta", "\u0398 "),
+       # accuracy_type = str_replace(accuracy_type, "spat_p_theta", "\u0398 "))
+    
+         overall_acc <- ggplot(aes(y = value, x = accuracy_type, fill = slice_no), data = acc2 ) + #fill = accuracy_type
+     geom_boxplot() +
+     scale_fill_brewer(type = "qual") +
+     facet_grid(bgc~type, labeller = labeller(type = 
+                                             c("1_spatial" = "spatial",
+                                               "2_aspatial" = "aspatial")), scales = "free_x")+
+     #facet_wrap(~acc_type)+
+     #geom_jitter(position=position_jitter(width=.1), colour = "grey", alpha = 0.8) + 
+     geom_hline(yintercept = 65,linetype ="dashed", color = "black") + 
+      theme_pem_facet() +
+       scale_fill_manual(values=c("grey90", "grey70", "grey50", "grey10"))+
+     theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position="none") +
+     xlab("Metric") + ylab("Accuracy") + 
+     ylim(0, 1)
+
+   
+   overall_acc
+   
+   finalise_facet_plot(overall_acc, "./PEM_standards_manuscripts/outputs/accuracy_LOO.png", width_pixels=480,
+                          height_pixels=480)
+
+    acc_tab <- acc_theta_raw2 %>%  dplyr::select(-slice, -type) %>% mutate(accuracy_type = factor(accuracy_type)) %>%   
+     group_by(bgc, slice_no, accuracy_type) %>%
+     summarise(mean = mean(value))
+
+#ggsave()
+```
+
+```{r compare accuracy of different slice numbers, echo = FALSE, warning = FALSE, message= FALSE}
+###readin saved acc output 
+#data_all <- read_csv(file.path(onedrive, "loo",  "SBSmc2acc_results.csv"))[,-1]
+ data_all <- acc
+allcomp_sbsmc <- read_csv(file.path(AOI_dir, "results", "num_slice_acc", "SBSmc2matrix.csv"))[,-1]
+
+bgcs2 <- "SBSmc2"
+
+equal_mapunits <- n_mapunits %>% rowid_to_column("slice") %>% filter(mapunit_all == 8) %>% dplyr::select(slice)
+allcomp_sbsmc <- allcomp_sbsmc[allcomp_sbsmc$slice %in% equal_mapunits$slice,] 
+# 
+# # check the number of site series per slice
+# data_check_ss <- as.data.frame(table(data_all$slice))
+# data_check_no <- as.data.frame(table(data_all$slice_no))
+# data_check <- as.data.frame(table(data_check_ss$Freq))
+# 
+# to_include <- data_check_ss %>%
+#   filter(Freq == 7) %>%
+#   pull(Var1) %>% droplevels()
+# 
+# # filter out site series in which there are only all units 
+# 
+equal_data <- data_all %>%  filter(slice %in% equal_mapunits$slice)
+# check the number of site series per slice
+data_check_ss <- as.data.frame(table(data_all$slice))
+data_check_no <- as.data.frame(table(data_all$slice_no))
+data_check <- as.data.frame(table(data_check_ss$Freq))
+
+# to_include <- data_check_ss %>%
+#   filter(Freq == 5) %>%
+#   pull(Var1)
+# 
+# # filter out site series in which there are only all units 
+# 
+# equal_data <- data_all %>%
+#   filter(slice %in% to_include)
+
+#acc_sum <- equal_data  %>%
+acc_sum <- data_all  %>%
+   mutate(slice = as.factor(slice)) %>%
+    mutate(across(ends_with("overall"), ~.x *100)) %>%
+    mutate(across(ends_with("meanacc"), ~.x *100)) %>%
+    dplyr::select(slice_no, slice, transect_no,
+                  aspat_p_overall,  aspat_p_meanacc, 
+                  aspat_fp_overall,  aspat_fp_meanacc,
+                  spat_p_overall, spat_p_meanacc,
+                  spat_pf_overall,  spat_pf_meanacc, 
+                  aspat_pa_overall,  aspat_pa_meanacc,
+                  aspat_fpa_overall, aspat_fpa_meanacc,
+                  spat_pa_overall,  spat_pa_meanacc,
+                  spat_fpa_overall, spat_fpa_meanacc ) %>%
+  distinct() %>% mutate(slice_no = as.factor(slice_no))
+
+acc_sum_long <- acc_sum %>%
+    pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+  filter(accuracy_type != "transect_no") #%>%
+#  mutate(value = value*100)
+
+# add the grouping for number of slices (and calculate average)
+bsRes2_all <- acc_sum_long %>% mutate(accuracy_type = as.factor(accuracy_type))
+
+count <- acc_sum_long %>%
+  dplyr::select(slice_no, slice) %>%
+  distinct()
+
+# perform T-test
+#zz <- compare_means(value ~ slice_no, bsRes2_all, method = "t.test", group.by = "accuracy_type", p.adjust.method = "holm") 
+
+
+bsRes2_detail <- format_accuracy_measures(bsRes2_all)
+
+# calculate the averages for each slice no. 
+bs_slice_ave <- bsRes2_all %>%
+  group_by(accuracy_type, slice_no) %>%
+  dplyr::summarise(total = sum(value), 
+            ave = mean(value),
+            sd = sd (value),
+            lb = ave-sd,
+            ub = ave+sd, 
+            count = n())
+
+
+bs_slice_ave <- format_accuracy_measures(bs_slice_ave)
+bs_slice_ave $slice_no = as.factor(bs_slice_ave $slice_no)
+bsRes2_detail$slice_no = as.factor(bsRes2_detail$slice_no)
+
+overall_acc <- ggplot(aes(y = value, x = accuracy_type_label, fill = slice_no), data = bsRes2_detail) + 
+  geom_boxplot() +
+  facet_wrap(~type_f, nrow = 2)+
+  geom_hline(yintercept = 65,linetype ="dashed", color = "black", size = 0.8) + 
+  ggtitle(paste0( bgcs2)) + 
+  theme(axis.text.x = element_text(angle = 90)) +
+  xlab("accuracy metric") + ylab("Accuracy") + 
+  #ylim(-0.05, 100) +
+  theme_pem_facet() + 
+  scale_fill_discrete_sequential(palette = "Light Grays")
+overall_acc
+
+```
+
+
+
+## Impact of adding more slices
+
+The plots below show the range in spread of accuracy measures when additional slices are added. 
+The initial plot shows boxplot results (95% spread of data with the quartiles). 
+The second plot shows the **average** and **standard deviation** of all replicates for the number of slices, for examples slice no = 1 is two slices of data (1 for train and 1 for test), Slice no. 4 = 1 test and 3 train. 
+
+SBSmc2 = 75 model runs (5 slices)
+ESSFmc = 186 model runs (6 slices)
+ESSFmcw = 2 model runs (2 slices)
+
+```{r, echo = FALSE}
+overall_acc
+
+```
+
+## ESSFmc. 
+ This variant has 6 slices but very imbalanced in transect number per slice. 
+
+```{r, echo = FALSE, messgae = FALSE}
+data_all <- read_csv(file.path(paste0(AOI_dir), "results", "num_slice_acc", "ESSFmcacc_results.csv"))[,-1]
+
+bgcs2 <- "ESSFmc"
+
+# check the number of site series per slice
+data_check_ss <- as.data.frame(table(data_all$slice))
+data_check_no <- as.data.frame(table(data_all$slice_no))
+data_check <- as.data.frame(table(data_check_ss$Freq))
+
+acc_sum <- data_all  %>%
+   mutate(slice = as.factor(slice)) %>%
+    mutate(across(ends_with("overall"), ~.x *100)) %>%
+    mutate(across(ends_with("meanacc"), ~.x *100)) %>%
+    dplyr::select(slice_no.x, slice, transect_no,
+                  aspat_p_overall,  aspat_p_meanacc, 
+                  aspat_fp_overall,  aspat_fp_meanacc,
+                  spat_p_overall, spat_p_meanacc,
+                  spat_pf_overall,  spat_pf_meanacc, 
+                  aspat_pa_overall,  aspat_pa_meanacc,
+                  aspat_fpa_overall, aspat_fpa_meanacc,
+                  spat_pa_overall,  spat_pa_meanacc,
+                  spat_fpa_overall, spat_fpa_meanacc ) %>%
+  distinct() %>% mutate(slice_no.x = as.factor(slice_no.x))
+
+acc_sum_long <- acc_sum %>%
+    pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+  filter(accuracy_type != "transect_no")
+
+# add the grouping for number of slices (and calculate average)
+bsRes2_all <- acc_sum_long %>% mutate(accuracy_type = as.factor(accuracy_type))
+
+# perform T-test
+zz <- compare_means(value ~ slice_no.x, bsRes2_all, method = "t.test", group.by = "accuracy_type", p.adjust.method = "holm") 
+
+bsRes2_detail <- format_accuracy_measures(bsRes2_all)
+
+overall_acc1 <- ggplot(aes(y = value, x = accuracy_type_label, fill = as.factor(slice_no.x)),data = bsRes2_detail) + 
+   geom_boxplot() +
+  facet_wrap(~type_f, nrow = 2)+
+  geom_hline(yintercept = 65,linetype ="dashed", color = "black", size = 0.8) +  
+  ggtitle(paste0("Accuracy measure with increasing slices: ", bgcs2)) + 
+  theme(axis.text.x = element_text(angle = 90)) +
+  xlab("iteration") + ylab("Accuracy") + 
+  ylim(-0.05, 100) +
+  theme_pem_facet() + 
+  scale_fill_discrete_sequential(palette = "Light Grays")
+```
+
+```{r, echo = FALSE}
+overall_acc1
+
+```
+
+## ESSFmcw
+
+```{r - essfmcw, echo = FALSE}
+###readin saved acc output csv s and combine
+data_all <- read_csv(file.path(paste0(AOI_dir), "results", "num_slice_acc", "ESSFmcwacc_results.csv"))[,-1]
+
+bgcs2 <- "ESSFmcw"
+
+# check the number of site series per slice
+data_check_ss <- as.data.frame(table(data_all$slice))
+data_check_no <- as.data.frame(table(data_all$slice_no))
+data_check <- as.data.frame(table(data_check_ss$Freq))
+
+acc_sum <- data_all  %>%
+   mutate(slice = as.factor(slice)) %>%
+    mutate(across(ends_with("overall"), ~.x *100)) %>%
+    mutate(across(ends_with("meanacc"), ~.x *100)) %>%
+    dplyr::select(slice_no, slice, transect_no,
+                  aspat_p_overall,  aspat_p_meanacc, 
+                  aspat_fp_overall,  aspat_fp_meanacc,
+                  spat_p_overall, spat_p_meanacc,
+                  spat_pf_overall,  spat_pf_meanacc, 
+                  aspat_pa_overall,  aspat_pa_meanacc,
+                  aspat_fpa_overall, aspat_fpa_meanacc,
+                  spat_pa_overall,  spat_pa_meanacc,
+                  spat_fpa_overall, spat_fpa_meanacc ) %>%
+  distinct() %>% mutate(slice_no = as.factor(slice_no))
+
+acc_sum_long <- acc_sum %>%
+    pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+  filter(accuracy_type != "transect_no")
+
+# add the grouping for number of slices (and calculate average)
+bsRes2_all <- acc_sum_long %>% mutate(accuracy_type = as.factor(accuracy_type))
+
+# perform T-test
+#zz <- compare_means(value ~ slice_no, bsRes2_all, method = "t.test", group.by = "accuracy_type", #p.adjust.method = "holm") 
+
+bsRes2_detail <- format_accuracy_measures(bsRes2_all)
+
+overall_acc2 <- ggplot(aes(y = value, x = accuracy_type_label, fill = as.factor(slice_no)),data = bsRes2_detail) + 
+   geom_boxplot() +
+  facet_wrap(~type_f, nrow = 2)+
+  geom_hline(yintercept = 65,linetype ="dashed", color = "black", size = 0.8) +  
+  ggtitle(paste0("Accuracy measure with increasing slices: ", bgcs2)) + 
+  theme(axis.text.x = element_text(angle = 90)) +
+  xlab("iteration") + ylab("Accuracy") + 
+  ylim(-0.05, 100) +
+  theme_pem_facet() + 
+  scale_fill_discrete_sequential(palette = "Light Grays")
+
+```
+
+
+```{r}
+overall_acc2
+```
+
+
+**Take aways**
+- overall accuracy improves with adding more data
+- minimal change in the error bars (potentially an issue?)
+
+```{r, echo = FALSE, eval = FALSE}
+### Number of site series sampled by number of slices used in build
+bgcoi_string = "sbsmc"
+
+allcomp <- read_csv(file.path(AOI_dir, "results", "num_slice_acc", "SBSmc2matrix.csv"))[,-1]
+
+# trDat2 <- tpts %>%
+#   filter(str_detect(tid, bgcoi_string)) %>% # need to adjust this
+#   mutate(slice = as.factor(slice)) %>%
+#   dplyr::select(-bgc_cat)
+# 
+
+n_mapunits <- foreach(k = 1:nrow(allcomp), .combine=rbind) %do% {
+#n_mapunits <- foreach(k = 1:5, .combine=rbind) %do% {  
+#k = 1
+   
+   train_slice <- allcomp[k,2:(length(allcomp)-2)] %>% droplevels() %>% t()
+   test_slice <- allcomp[k,1] %>% droplevels() %>% t()
+  
+   # training set
+  BGC_train <- trDat %>% 
+    dplyr::filter(slice %in% train_slice) %>%
+    filter(is.na(target2)) %>% 
+    filter(!is.na(target))
+  
+  mapunit_no <- length(unique(BGC_train$target)) %>% as.data.frame %>% dplyr::rename(mapunit_no = 1)
+ 
+  BGC_test <- trDat2 %>% dplyr::filter(slice %in% test_slice) #%>%    
+ # filter(is.na(target2)) %>% filter(!is.na(target))
+  
+  mapunit_test <- length(unique(BGC_test$target)) %>% as.data.frame %>% dplyr::rename(mapunit_test = 1) 
+
+  all <- rbind(BGC_test, BGC_train)
+  all_no <- length(unique(all$target)) %>% as.data.frame %>% dplyr::rename(mapunit_all = 1) 
+  
+  build_no <- allcomp[k,]  %>% dplyr::select(slice_no) 
+  mapunit_count <- cbind(build_no, mapunit_no, mapunit_test, all_no)
+  mapunit_count <- mapunit_count %>%
+    mutate(slice = paste0(k))
+}
+
+
+overall_acc1 <- ggplot(aes(y = mapunit_all, x = slice_no),data = n_mapunits) + 
+  ggtitle(paste0(bgcoi_string)) +   
+  geom_jitter( width = 0, height = .2) +
+   xlab("Number of Slices in Analysis Set") + ylab("Map units in Sample Set")+
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 10), breaks= pretty_breaks()) +
+  theme_pem()
+overall_acc1
+
+ggsave("../PEM_standards_manuscripts/ESSFmc_UnitsperAnalysisSetSize.pdf")
+
+```
+
+
+

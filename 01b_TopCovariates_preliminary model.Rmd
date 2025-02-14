@@ -1,0 +1,383 @@
+---
+title: "Find top stand-level covariates for compare hypercubes function"
+output: html_document
+params:
+  outDir: "."
+  trDat: trDat
+  target: target
+  target2: target2
+  tid: tid
+  rseed: NA
+  infiles: infiles
+  mmu: mmu
+  mname: mname
+  field_transect: field_transect
+---
+
+The is script is set up as a one off to determine the create and save BGC models with optimization of training set balancing and tuning.  This modelling script is based on the sliced data approach.
+A. For each BGC reduce variables and tune-hyperparameters
+1.  Bring in training data .gpkg for the S1 cleaned data. Should be collected by slice.
+2.  Running all covariates and non-forest groups which then get converted (after prediction) to simply non-for class
+3.  Do recursive feature selection to reduce the variable set for each BGC and save the list of variables
+4.  Tune hyper-parameters for each model and save.
+
+B. Find best balance
+1.  Run a grid of downsampling/smoting combination models and output the accuracy metrics for each combination. This can take some time to run.
+2.  Outputs will include p, pa, fuzzy, and theta metrics
+3.  Compile all balancing accuracy files and find the best for different metrics. Need to choose which metric to apply as "best" as compared to "raw" data.
+4.  Save to file for use in building final model
+
+C. Build final model  
+
+1.  Select the best balance by BGC, reduced set of features, and hyper parameter tuning and generate and save the final BGC model 
+2.  Check for under-predicted map units and then add in extra points for those units to do the final test on whether more data can improve the model (or is it a covariate/mapunit problem)
+
+```{r setup, include=FALSE, echo = FALSE}
+
+library(data.table)
+library(scales)
+library(sf)
+library(ranger)
+library(tidyverse)
+library(fasterize)
+library(stringr)
+library(dplyr)
+library(raster)
+library(readxl)
+library(foreach)
+library(tidymodels)
+library(themis)
+#library(vip)
+require(stringi)
+#library(knitr)
+library(ggplot2)
+library(janitor)
+require(ggthemes)
+library(colorspace)
+#install_github("bcgov/envreportutils")
+
+#library(envreportutils)
+```
+
+Set directories, sources, lookup tables
+
+```{r, eval = FALSE, echo = FALSE}
+
+## set up file structure
+AOI <- "Deception"
+#AOI <- "BoundaryTSA"
+#AOI <- "EagleHills"\
+#AOI <- "DateCreek"
+
+AOI_dir <- file.path("..", paste0(AOI,"_AOI"))
+cov_dir <- file.path(AOI_dir, "1_map_inputs", "covariates", "5m")
+shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+input_pnts_dir <- file.path(AOI_dir, "1_map_inputs", "trainingData", "att_5m")
+#out_dir <- file.path(AOI_dir, "3_models")
+out_dir <- file.path("../PEM_standards_manuscripts/models")
+
+
+# read in temp functions
+source(here::here('_functions', 'model_gen_tidy.R'))
+source(here::here('_functions', 'acc_metrix_WHM.R'))
+source(here::here('_functions', 'balance_recipe_WHM.R'))
+source(here::here('_functions', 'doc_theme_pem.R'))
+
+# read in map and model keys
+map.key  <- read.csv("../PEM_standards_manuscripts/_MapUnitLegend/Deception_MapUnitLegend.csv", 
+                       stringsAsFactor = FALSE)
+
+#map.key <- read.csv(paste0(AOI_dir, "/_MapUnitLegend/", AOI, "_MapUnitLegend.csv"))
+
+# #read in the fuzzy index
+fMat <- read.csv("../PEM_standards_manuscripts/_MapUnitLegend/fuzzy_matrix_basic_updated.csv") %>%
+  dplyr::select(c(target, Pred, fVal)) %>% distinct ()
+fMat <- data.table(fMat)
+
+#if(AOI == "BoundaryTSA"){
+bec_shp <- st_read(file.path(shapes_dir, "bec_edited.gpkg"), quiet = TRUE)
+#} else {
+#bec_shp <- st_read(file.path(shapes_dir, "bec_edited.gpkg"), quiet = TRUE)
+#}
+
+```
+
+Import and prepare the data for the modelling process
+
+```{r compile model parameters, eval = FALSE, echo = FALSE}
+
+# read in model parameters 
+model_param <- file.path("../PEM_standards_manuscripts/_MapUnitLegend/models_WHM.xlsx")
+
+# set up model parameters:  
+mparam <- read_xlsx(model_param, "models") %>% filter(to_run == 1)
+map_res <- mparam$resolution
+data_res <- paste0("att_", map_res, "m")
+mname <- paste0(mparam$model_name)
+mrep <- mparam$model_rep
+
+# check which category of model to be produced
+mtype <- case_when(
+  str_detect(mname, "for_nf")  ~ "forest_non_forest",
+  str_detect(mname, "nf_") ~ "non_forest",
+  str_detect(mname, "fore") ~ "forest"
+)
+
+# get covariates
+mcov <- read_xlsx(model_param, "covariates", skip = 2) %>%
+  filter(!!sym(mparam$covariates) == 1) %>%
+  dplyr::select(covariate)
+
+# get training point sets
+mtpt <- read_xlsx(model_param, "training_pts", skip = 2) %>%
+  filter(!!sym(mparam$training_pts) == 1) %>%
+  dplyr::select(tp_code)%>%
+  pull
+
+# get the map unit level 
+mmu <- read_xlsx(model_param, "map_unit", skip = 2) %>%
+   filter(!!sym(mparam$map_unit) == 1) %>%
+  dplyr::select(legend_column)%>%
+  pull
+
+mmu <- case_when(
+  mmu == "column_mu" ~ "MapUnit", 
+  mmu == "column_ss" ~ "SiteSeries",
+  mmu == "column_ass" ~ "Association",
+  mmu == "column_cls" ~ "Class",
+  mmu == "column_grp" ~ "Group",
+  mmu == "column_typ" ~ "Type",
+  mmu == "column_full" ~ "Full")
+# set up outfolder: 
+if(!dir.exists(file.path(out_dir, mtype))){dir.create(file.path(out_dir, mtype))} 
+
+out_dir <- file.path(out_dir, mname) 
+
+# filter covars
+res_folder <- paste0(map_res, "m")
+
+rast_list <- list.files(file.path(cov_dir), pattern = ".tif$", full.names = TRUE)
+
+rast_list <- rast_list[tolower(gsub(".tif", "", basename(rast_list))) %in% tolower(mcov$covariate)]
+
+mcols <- gsub(".tif","", tolower(basename(rast_list)))
+
+bec_shp <- st_read(file.path(shapes_dir, "bec.gpkg"), quiet = TRUE)
+
+# read in training pt data
+
+
+indata <- list.files(file.path(input_pnts_dir), paste0(mtpt,"_att.*.gpkg$"), full.names = TRUE)
+indata <-"../Pem_standards_manuscripts/inputs/s1_clean_neighbours_allatts.gpkg" 
+tpts <- st_read(indata) 
+###remote data tests
+# indata <-"../Pem_standards_manuscripts/inputs/r1_neighbours_att.gpkg" 
+# tpts <- st_read(indata)
+# tpts <- tpts %>% separate(col=mapunit, into=c("mapunit1", "mapunit2"), sep="/") %>%
+#   dplyr::mutate(tid = transect_id)
+# tpts_update <- st_read(indata2) %>% dplyr::select(geom, mapunit1)
+# tpts2 <- st_join(tpts, tpts_update, by = "geom") %>% mutate(mapunit1 =  mapunit1.y) %>% dplyr::select(-mapunit1.x, mapunit1.y) %>% dplyr::select(mapunit1, everything())
+# st_write(tpts2, "../Pem_standards_manuscripts/inputs/s1_clean_pts_att_2021_2.gpkg")
+tpts <- tpts %>% filter(!mapunit1 == "") %>% filter(!is.na(mapunit1)) %>% mutate(mapunit2 = replace_na(mapunit2, "")) %>% distinct()
+target1.unique <- tpts %>% dplyr::select(mapunit1) %>% distinct
+target2.unique <- tpts %>% dplyr::select(mapunit2) %>% distinct %>% dplyr::rename(mapunit1 = mapunit2)
+target.unique <- rbind(target1.unique, target2.unique) %>% as.data.frame %>% dplyr::select(mapunit1)  %>% distinct()
+fwrite(target.unique, paste0(AOI_dir, "/fieldmapunits.csv"))
+
+infiles <- basename(indata) 
+
+#  MU_count <- tpts %>% dplyr::count(mapunit1)
+#table(tpts$mapunit1)
+
+# match to the key and filter for forest and non_forest points
+
+subzones <- unique(bec_shp$MAP_LABEL)
+subzones <- gsub("\\s+","",subzones )
+
+bec_shp <- bec_shp %>% mutate()
+
+tpts  <- tpts %>%
+  cbind(st_coordinates(.)) %>%
+  mutate(fnf = ifelse(grepl(paste0(subzones, collapse = "|"), mapunit1), "forest", "non_forest")) %>%
+  st_join(st_transform(bec_shp[, "MAP_LABEL"], st_crs(.)), join = st_nearest_feature) %>%
+  st_drop_geometry() %>% 
+  dplyr::select(fnf, everything()) %>% #dplyr::select(-x, -y, -bgc_cat) %>% 
+  dplyr::rename(bgc_cat = MAP_LABEL) %>% 
+  rename_all(.funs = tolower) %>% 
+  droplevels()
+
+#tpts <- tpts %>%
+#  filter(!is.na(tid))
+
+tpts <- tpts %>%
+  #mutate(slice = 1) %>%
+  mutate(bgc_cat = gsub(" ", "", bgc_cat)) 
+
+
+# match the column for map unit based on key 
+# select the target column using the mapkey if needed: 
+  map.key.sub <- map.key %>%
+      dplyr::select(BaseMapUnit, !!sym(mmu)) %>%
+      distinct() %>% dplyr::rename(MapUnit = 2)
+  
+  tpts <- tpts %>% left_join(map.key.sub, by = c("mapunit1" = "BaseMapUnit")) %>%
+    left_join(map.key.sub, by = c("mapunit2" = "BaseMapUnit")) %>%
+    dplyr::select(-mapunit1, -mapunit2) %>%
+    dplyr::rename("mapunit1" = MapUnit.x,
+                  "mapunit2" = MapUnit.y) %>%
+    dplyr::select(mapunit1, mapunit2, everything())
+
+
+# filter for forest or non_forest points as required
+if(mtype %in% c("forest", "non_forest")) {
+   tpts <- tpts %>% filter(fnf == mtype)
+} 
+
+tpts <- tpts %>% 
+    mutate(target = as.factor(mapunit1),
+                          target2 = as.factor(mapunit2)) 
+tpts$mapunit2[is.na(tpts$mapunit2)] <- ""
+# filter columns
+mpts <- tpts %>%
+     dplyr::select(id, position, target, target2, transect_id, tid, slice, bgc_cat, any_of(mcols)) %>% 
+       #dplyr::select(id, position, target, target2, transect_id, tid, slice, bgc_cat, everything()) %>% 
+  filter(!target == "") %>% filter(!is.na(target)) %>% droplevels()  #
+
+mpts$transect_id <-   str_replace_all(mpts$transect_id ,c("ESSFmc2" = "ESSFmc", "essfmc" = "ESSFmc" , "sbsmc" = "SBSmc"))
+mpts$tid <-   str_replace_all(mpts$tid , c("ESSFmc2" = "ESSFmc", "essfmc" = "ESSFmc" , "sbsmc" = "SBSmc"))
+
+
+# mpts <- tpts %>%
+#      dplyr::select(target, target2, bgc_cat, any_of(mcols)) %>% 
+#   filter(!target == "") %>% filter(!is.na(target)) %>% droplevels()
+# fwrite(mpts, "D:/GitHub/PEM_Methods_DevX/PEM_standards_manuscripts/models/allextra_pts.csv")
+
+####Move ESSFmc slice 6 transect to fill other slices - based on a comparison of landscape covars
+  # sliceupdate <- fread("../Pem_standards_manuscripts/inputs/updateESSFslices.csv") %>%
+  #   mutate(slice_new = as.character(slice_new)) %>% setDT
+  # setDT(mpts)
+  # mpts <- mpts[sliceupdate, slice := slice_new, on = "tid" ]
+##-----------------------
+zones <- c(as.character(subzones))
+
+bgc_pts_subzone <- lapply(zones, function (i){
+      pts_subzone <- mpts %>%
+        filter(str_detect(transect_id, as.character(paste0(i, "_")))) %>% ###changed this from target to allow inclusion of non-forest by bgc
+        #         filter(str_detect(bgc_cat, as.character(paste0(i)))) %>%
+        droplevels()
+      
+      if(nrow(pts_subzone) == 0){ pts_subzone = NULL} else {ppts_subzone = pts_subzone }
+      pts_subzone
+  })
+  
+# generate a name for list objects removing NULL values
+names <- unlist(lapply(bgc_pts_subzone, is.null))
+zone_names <- zones[-(which(ll <- names)) ] 
+  
+# remove null or missing subzones data sets 
+bgc_pts_subzone =  bgc_pts_subzone[-which(sapply(bgc_pts_subzone, is.null))]
+names(bgc_pts_subzone) <- zone_names
+
+```
+
+
+```{r feature reduction}
+##remove correlated variables: changed this to do it once for entire training set rather than by BGC
+
+trDat_centre <- mpts %>% filter(!target == "") %>%
+ dplyr::filter(position %in% "Orig") %>%
+dplyr::select(-slice, -target2, -transect_id, -tid, -bgc_cat, -id, -position, -bgc)
+
+corr_recipe <-  recipe(target ~ ., data = trDat_centre)
+corr_filter <- corr_recipe %>%
+  step_corr(all_numeric_predictors(), threshold = .7) %>% 
+  step_nzv(all_numeric_predictors())
+ all.var <- trDat_centre %>%  dplyr::select(-target) %>% colnames %>% data.frame
+#
+filter_obj <- prep(corr_filter, training = trDat_centre)
+#
+ reduced.var <- juice(filter_obj) %>% dplyr::select(-target) %>% colnames
+ reduced.var2 <- reduced.var %>% data.frame
+ fwrite(reduced.var2, file.path (out_dir, "rfe_variables.csv"))
+```
+
+
+```{r VIP with DEM only}
+###--Run to create a preliminary VIP plot by BGC- manual at this point
+  require(vip)
+bgc_test <- mpts %>%  dplyr::filter(bgc_cat == "ESSFmc") %>% filter(!target == "") %>%
+ dplyr::filter(position %in% "Orig") %>%
+dplyr::select(target, reduced.var) %>% droplevels#  %>% dplyr::select( -swi_slope)#,-vc3_mosaic_rproj_q25
+
+ best_recipe <-  recipe(target ~ ., data = bgc_test)
+
+    randf_spec <- rand_forest(mtry = 5, min_n = 5, trees = 200) %>%
+          set_mode("classification") %>%
+          set_engine("ranger", importance = "permutation", 
+                     verbose = FALSE)
+
+        pem_workflow <- workflow() %>%
+          add_recipe(best_recipe) %>%
+          add_model(randf_spec)
+
+        PEM_rf1 <- fit(pem_workflow, bgc_test)
+        final_fit1 <- extract_fit_parsnip(PEM_rf1)
+       round(PEM_rf1$fit$fit$fit$prediction.error, 3)
+       
+              ESSFmc_vip <- final_fit1 %>%   vip(num_features = 10)  
+       
+bgc_test <- mpts %>% dplyr::filter(bgc_cat == "ESSFmcw") %>% filter(!target == "") %>%
+ dplyr::filter(position %in% "Orig") %>%
+dplyr::select(target, reduced.var) %>% droplevels# %>%  dplyr::select(-swi_slope, -cov_gap_mosaic_rproj_q25)
+
+ best_recipe <-  recipe(target ~ ., data = bgc_test)
+
+    randf_spec <- rand_forest(mtry = 5, min_n = 5, trees = 200) %>%
+          set_mode("classification") %>%
+          set_engine("ranger", importance = "permutation", 
+                     verbose = FALSE)
+
+        pem_workflow <- workflow() %>%
+          add_recipe(best_recipe) %>%
+          add_model(randf_spec)
+
+        PEM_rf1 <- fit(pem_workflow, bgc_test)
+        final_fit2 <- extract_fit_parsnip(PEM_rf1)
+       round(PEM_rf1$fit$fit$fit$prediction.error, 3)
+       
+          ESSFmcw_vip <- final_fit2 %>%   vip(num_features = 10)
+          
+bgc_test <- mpts %>% dplyr::filter(bgc_cat == "SBSmc2") %>% filter(!target == "") %>%
+ dplyr::filter(position %in% "Orig") %>%
+dplyr::select(target, reduced.var) %>% droplevels# %>%   dplyr::select(-swi_slope)
+
+ best_recipe <-  recipe(target ~ ., data = bgc_test)
+
+    randf_spec <- rand_forest(mtry = 5, min_n = 5, trees = 200) %>%
+          set_mode("classification") %>%
+          set_engine("ranger", importance = "permutation", 
+                     verbose = FALSE)
+
+        pem_workflow <- workflow() %>%
+          add_recipe(best_recipe) %>%
+          add_model(randf_spec)
+
+        PEM_rf1 <- fit(pem_workflow, bgc_test)
+        final_fit3 <- extract_fit_parsnip(PEM_rf1)
+       round(PEM_rf1$fit$fit$fit$prediction.error, 3)
+
+       SBSmc2_vip <- final_fit3 %>%   vip(num_features = 10)
+```
+
+
+```{r arrange into graphic output}
+grid.arrange(ESSFmc_vip, ESSFmcw_vip, SBSmc2_vip )
+ g <- arrangeGrob(ESSFmc_vip, ESSFmcw_vip, SBSmc2_vip , nrow=3)
+ggsave("../PEM_standards_manuscripts/outputs/VIP.pdf", g)
+
+
+```
+
+
+
+

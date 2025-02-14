@@ -1,0 +1,678 @@
+---
+title: "Summary Stats for Deception Test Case"
+output: html_document
+params:
+  outDir: "."
+  trDat: trDat
+  target: target
+  target2: target2
+  tid: tid
+  rseed: NA
+  infiles: infiles
+  mmu: mmu
+  mname: mname
+  field_transect: field_transect
+  
+---
+
+## This should be setup in a 4 deep loop
+1. i iterations of models. I don't think we need to worry about point reduction. We are using the test transect metrics. 
+        Effect of tp balancing, raw, smote .25/downsample 75, smote .5/down 50, smote .75/down 25, smote 1/down50
+2. j iterations of BGC
+3. k iterations of Train/Test slices leave one out (build 4 test 1. Further test of build 3 test 2, build 2 test 3, and build 1 test 4  for the ESSFmc and SBSmc2 only once inner loop optimization has occurred)
+4. for each iteration build cv model and predict test -> return accuracy metrics 
+Prepare directories
+
+```{r setup, include=FALSE}
+
+library(data.table)
+library(scales)
+library(cowplot)
+library(caret)
+library(sf)
+library(ranger)
+library(tidyverse)
+library(fasterize)
+library(stringr)
+library(dplyr)
+library(raster)
+library(terra)
+library(readxl)
+library(stars)
+library(stringr)
+library(foreach)
+library(tidymodels)
+library(themis)
+library(vip)
+require(stringi)
+require(R.utils)
+library(data.table)
+#library(knitr)
+library(tidymodels)
+
+library(themis)
+library(ggplot2)
+library(gridExtra)
+library(janitor)
+require(magicfor) 
+require(ggpubr)
+require(ggthemes)
+require(viridis)
+require(viridisLite)
+require(philentropy)
+require(formattable)
+require(utils)
+require(flextable)
+#devtools::install_github("tidymodels/tune")
+#devtools::install_github("tidymodels/parsnip")
+library("htmltools")
+library("webshot") 
+#source("/_functions/export_forattable")
+export_formattable <- function(f, file, width = "100%", height = NULL, 
+                               background = "white", delay = 0.2)
+    {
+      w <- as.htmlwidget(f, width = width, height = height)
+      path <- html_print(w, background = background, viewer = NULL)
+      url <- paste0("file:///", gsub("\\\\", "/", normalizePath(path)))
+      webshot(url,
+              file = file,
+              selector = ".formattable_widget",
+              delay = delay,
+              vwidth = 1200, vheight = 400)
+    }
+
+```
+
+```{r session setup, tidy = TRUE, warning=FALSE}
+
+AOI <- "Deception"
+#AOI <- "BoundaryTSA"
+# set up file structure
+AOI_dir <- file.path(".", paste0(AOI,"_AOI"))
+cov_dir <- file.path(AOI_dir, "1_map_inputs", "covariates")
+shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+input_pnts_dir <- file.path(AOI_dir, "1_map_inputs", "trainingData")
+out_dir <- file.path(AOI_dir, "3_maps_analysis","models")
+results_dir <- file.path(AOI_dir, "results")
+
+# read in temp functions
+source(here::here('_functions', 'model_gen.R'))
+source(here::here('_functions', 'point_subsample.R'))
+#source(here::here('_functions', 'predict_landscape.R'))
+source(here::here('_functions', 'predict_map.R'))
+source(here::here('_functions', 'model_gen_tidy.R'))
+source(here::here('_functions', 'doc_theme_pem.R'))
+
+# read in map and model keys
+map.key  <- read.csv(file.path(AOI_dir, "_MapUnitLegend", 
+                                 paste0(AOI, "_MapUnitLegend.csv")), 
+                       stringsAsFactor = FALSE)
+
+# #read in the fuzzy index
+#fMat <- read.csv(file.path(AOI_dir, "_MapUnitLegend", 
+#                                  "fuzzy_matrix_basic.csv")) 
+#fMat <- data.table(fMat)
+
+# get the map unit level 
+model_param <- file.path(AOI_dir, "_MapUnitLegend", "models.xlsx")
+
+# set up model parameters:  
+mparam <- read_xlsx(model_param, "models") %>% filter(to_run == 1)
+map_res <- mparam$resolution
+data_res <- paste0("att_", map_res, "m")
+mname <- paste0(mparam$model_name)
+mrep <- mparam$model_rep
+
+# check which catergory of model to be produced
+mtype <- case_when(
+  str_detect(mname, "for_nf")  ~ "forest_non_forest",
+  str_detect(mname, "nf_") ~ "non_forest",
+  str_detect(mname, "fore") ~ "forest"
+)
+
+mmu <- read_xlsx(model_param, "map_unit", skip = 2) %>%
+   filter(!!sym(mparam$map_unit) == 1) %>%
+  dplyr::select(legend_column)%>%
+  pull
+
+mmu <- case_when(
+  mmu == "column_mu" ~ "MapUnit", 
+  mmu == "column_ss" ~ "SiteSeries",
+  mmu == "column_ass" ~ "Association",
+  mmu == "column_cls" ~ "Class",
+  mmu == "column_grp" ~ "Group",
+  mmu == "column_typ" ~ "Type",
+  mmu == "column_full" ~ "Full")
+
+# get covariates
+mcov <- read_xlsx(model_param, "covariates", skip = 2) %>%
+  filter(!!sym(mparam$covariates) == 1) %>%
+  dplyr::select(covariate)
+mcol <- mcov$covariate
+
+# get training point sets
+mtpt <- read_xlsx(model_param, "training_pts", skip = 2) %>%
+  filter(!!sym(mparam$training_pts) == 1) %>%
+  dplyr::select(tp_code)%>%
+  pull
+
+```
+
+```{r accuracy metrics function, include = FALSE}
+## function to run accuracy metrics given a table with 2 columns representing target truth and predicted class
+# once finished shift to own function
+
+#data <-  acc_metrix(cv_pred_sum) #test.pred  
+
+# source("../_functions/acc_metrix_paper.R")
+
+```
+
+```{r, echo=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=FALSE,
+                      warning = FALSE, message = FALSE,
+                      results = 'show',
+                      eval = TRUE)  ## flag eval = false for quick text edits
+
+## Load the data and parameters as specified in the R script (model_gen_tidy.R)
+# 
+# trDat <- params$trDat
+# target <- params$target
+# target2 <- params$target2
+# tid <- params$tid
+# infiles<- params$infiles
+# mmu <- params$mmu
+# mname <- params$mname
+# field_transect <- params$field_transect
+# outDir <- params$outDir
+
+
+```
+
+This model uses the following parameters: 
+
+* **model reference:** `r params$mname` 
+* **mapunit:** `r mmu`
+* **training point set : **`r params$infiles`
+* **model response and covariates: ** `r names(trDat)`
+
+
+## Response variable: _`r target`_
+
+The following training points and frequency of points were used in the model. 
+
+```{r load data, echo = FALSE, include = TRUE}
+# trDat  <- fread(file.path(input_pnts_dir, "att_5m/Stage1_cleaned_5m_pts_data.csv"))
+# table(trDat[, target])
+
+indata <-"./Pem_standards_manuscripts/inputs/s1_clean_neighbours_allatts.gpkg" 
+#indata <-"../Pem_standards_manuscripts/inputs/allextrapts_merged.gpkg" 
+bgc_pts_subzone <- readRDS("./Pem_standards_manuscripts/inputs/model_input_pts.rds")
+
+  xx <- names(bgc_pts_subzone[1])
+
+  alldat = bgc_pts_subzone[[xx]]
+  tdat <- alldat %>% mutate(slice = factor(slice))
+  tdat <- tdat %>%
+    dplyr::select(id, mapunit1, mapunit2, position,
+                  transect_id, tid, slice)
+  #tdat <- tdat[complete.cases(tdat[, 8:length(tdat)]), ]
+
+  nf = c("A", "Non_veg", "R", "W","W_t","Wat", "X", "F", "Wb")
+
+  tdat_essf <- tdat %>%
+    dplyr::filter(position == "Orig") %>%
+    dplyr::select(mapunit1) %>%
+    mutate(BGC = xx)%>%
+    mutate(summ = n())%>%
+    rowwise() %>%
+    mutate(mapunit1 = ifelse(mapunit1 %in% nf, "NFor", mapunit1)) %>%
+    mutate(units = gsub("ESSFmc_", "", mapunit1))%>%
+    dplyr::filter(mapunit1 != "ESSFmcw_110")%>%
+    dplyr::filter(mapunit1 != "ESSFmcw_102")
+
+
+trDat <- st_read(indata)# %>% dplyr::select(mapunit1, mapunit2, bgc)
+bec_shp <- st_read("./Deception_AOI/00_raw_inputs/10_vector/bec_edited.gpkg", quiet = TRUE)
+
+tpts  <- trDat %>% filter(Position == "Orig") %>% data.frame
+tpts<- tpts %>% filter(!mapunit1 == "") %>% filter(!is.na(mapunit1)) %>% distinct()
+
+tpts  <- tpts %>% mutate(bgc_cat = sub("_.*", "", tpts$transect_id)) %>% mutate(bgc_cat = str_replace(bgc_cat, "essf", "ESSF"))
+
+
+#tpts <- tpts %>%
+#  filter(!is.na(tid))
+
+tpts <- tpts %>%
+  #mutate(slice = 1) %>%
+  mutate(bgc_cat = gsub(" ", "", bgc_cat))
+# tpts_update <- st_read(indata2) %>% dplyr::select(geom, mapunit1)
+# tpts2 <- st_join(tpts, tpts_update, by = "geom") %>% mutate(mapunit1 =  mapunit1.y) %>% dplyr::select(-mapunit1.x, mapunit1.y) %>% dplyr::select(mapunit1, everything())
+# st_write(tpts2, "../Pem_standards_manuscripts/inputs/s1_clean_pts_att_2021_2.gpkg")
+# %>% 
+  #mutate(target = mapunit1, target2 = mapunit2) %>% dplyr::select(target, target2, bgc_cat)
+#DataExplorer::create_report(trDat)
+# read in map and model keys
+map.key  <- read.csv(file.path(AOI_dir, "_MapUnitLegend", 
+                                 paste0(AOI, "_MapUnitLegend.csv")), 
+                       stringsAsFactor = FALSE)
+# select the target column using the mapkey if needed: 
+  map.key.sub <- map.key %>%
+      dplyr::select(BaseMapUnit, !!sym(mmu)) %>%
+      distinct() %>% dplyr::rename(MapUnit = 2)
+  
+
+  tpts <- tpts %>% left_join(map.key.sub, by = c("mapunit1" = "BaseMapUnit")) %>%
+    left_join(map.key.sub, by = c("mapunit2" = "BaseMapUnit")) %>%
+    dplyr::select(-mapunit1, -mapunit2) %>%
+    dplyr::rename("mapunit1" = MapUnit.x,
+                  "mapunit2" = MapUnit.y) %>%
+    dplyr::select(mapunit1, mapunit2, everything()) %>% 
+    mutate(target = mapunit1, target2 = mapunit2) 
+
+# convert <- c("X", "A", "W_t", "W", "Sc", "R", "F", "Non_veg","Wat", "Wb")
+# SBS10 <- c("SBSmc2_10a", "SBSmc2_10b")  
+# ### now roll up some units for the stacked bar chart
+#  tpts$target <-    if_else(tpts$target  %in% convert, as.character(NA), tpts$target) %>% replace_na("Non-forested")
+#  tpts$target2 <-    if_else(tpts$target2  %in% convert, as.character(NA), tpts$target2) %>% replace_na("Non-forested")
+#   tpts$target <-    if_else(tpts$target  %in% SBS10, as.character(NA), tpts$target) %>% replace_na("SBSmc2_10")
+#   tpts$target2 <-    if_else(tpts$target2  %in% SBS10, as.character(NA), tpts$target2) %>% replace_na("SBSmc2_10")
+  
+MU.for <- map.key %>% dplyr::select(MapUnit, Type) %>% filter(!Type == "For") %>% distinct() 
+nfor <- as.character(MU.for$MapUnit)
+#MU.for <- MU.for$MapUnit
+trDat <- tpts %>% dplyr::select(target, target2, bgc_cat)# %>% filter(target %in% MU.for)
+MU_count2 <- trDat %>% dplyr::count(bgc_cat,target)
+  #mpts <- tpts
+
+  ## filter for pure calls only
+  trDat$target2 <- trDat$target2 %>% na_if("")
+  #mpts <- mpts %>% filter(is.na(target2))
+  MU_count3 <- trDat %>% dplyr::count(target)
+  # filter groups less than 20 pts
+  #MU_count <- mpts %>% dplyr::count(target) %>% filter(n > 20) 
+
+# calculate summary of raw training data set
+####Build table of proportions of Map Units sampled 
+    trDat.bgc <- trDat %>% dplyr::select(bgc_cat, target)  %>% filter(!is.na(target), !target == "") %>% 
+      mutate(bgc_cat = ifelse(bgc_cat == "ESSFmc" & startsWith(trDat$target, "ESSFmcw"), "ESSFmcw", bgc_cat))# %>% mutate_if(is.character, as.factor)
+    #xx <-   trDat.bgc %>% filter(bgc_cat == "ESSFmc", startsWith(trDat.bgc$target, "ESSFmcw"))
+    trDat_sum.bgc <- trDat.bgc %>%
+  dplyr::group_by(bgc_cat, target) %>%
+  dplyr::summarise(freq = n()) #%>%
+#     mutate(prop = round(freq/sum(freq),3))
+fwrite(trDat_sum.bgc,"./PEM_standards_manuscripts/outputs/mapunitcount.csv"  )
+
+nonfor <- c("Xvt", "Xvh", "Ro", "Ag", "Am", "RI", "Non-forested", "CX", "Xvs", "Sk", "RP", "RD", "Fl", "Sc")
+wet <- c("Wb", "Ww", "LA", "Wf", "Ws", "Wa", "Wm")
+trDat.bgc$target <- gsub("ESSFmcw_", "", trDat.bgc$target)
+trDat.bgc$target <- gsub("ESSFmc_", "", trDat.bgc$target)
+trDat.bgc$target <- gsub("SBSmc2_", "", trDat.bgc$target)
+trDat_sum.bgc <- trDat.bgc %>% mutate(target = ifelse(target %in% nonfor, "NFor", 
+                                                      ifelse(target %in% wet, "Wet", target ))) %>% 
+  dplyr::group_by(bgc_cat, target) %>%
+  dplyr::summarise(freq = n()) %>%
+  mutate(prop = round(freq/sum(freq),3)) %>% mutate(target_bgc=factor(interaction(bgc_cat, target))) %>%
+    mutate(fct_reorder(target, prop, .desc = TRUE)) %>% mutate(prop = round(prop, 2))
+```
+
+
+```{r make graphics, echo = FALSE, include = TRUE}
+#trDat_sum.bgc$target_bgc <-  fct_reorder(trDat_sum.bgc$target_bgc, prop, .desc = TRUE)
+  # trDat_sum.bgc$target_bgc <- gsub("ESSFmcw.", "", trDat_sum.bgc$target_bgc)
+# trDat_sum.bgc$target_bgc <- gsub("ESSFmc.", "", trDat_sum.bgc$target_bgc)
+# trDat_sum.bgc$target_bgc <- gsub("SBSmc2.", "", trDat_sum.bgc$target_bgc)
+trDat_sum.bgc1 <- trDat_sum.bgc %>% filter(bgc_cat == "SBSmc2") %>% droplevels()
+  ss.ratio2 <- ggplot(trDat_sum.bgc1, aes(x = fct_reorder(target, prop, .desc = TRUE), y = prop,  label = target)) +
+  geom_bar( stat = "identity", colour = "white", size = .1) + 
+  theme(axis.text.x = element_text(angle = 0))+
+    scale_fill_grey()+
+  xlab("SBSmc2")+
+      ylab("")+
+        ylim(0,0.5)+
+  theme_pem()+
+  theme(legend.position = "none") +
+      geom_text(aes(label=prop), vjust=0, size = 3)
+ss.ratio2
+
+  finalise_plot (ss.ratio2, "./PEM_standards_manuscripts/outputs/ProportionMapUnitssampled_SBSmc2.png", 
+                          width_pixels=270,
+                          height_pixels=120)
+  
+  trDat_sum.bgc1 <- trDat_sum.bgc %>% filter(bgc_cat == "ESSFmc") %>% droplevels()
+  ss.ratio2 <- ggplot(trDat_sum.bgc1, aes(x = fct_reorder(target, prop, .desc = TRUE), y = prop,  label = target)) +
+  geom_bar( stat = "identity", colour = "white", size = .1) + 
+  theme(axis.text.x = element_text(angle = 0))+
+    scale_fill_grey()+
+  xlab("ESSFmc")+
+      ylab("")+
+        ylim(0,0.5)+
+  theme_pem()+
+  theme(legend.position = "none")+
+    geom_text(aes(label=prop), vjust=0, size = 3)
+ss.ratio2
+  finalise_plot (ss.ratio2, "./PEM_standards_manuscripts/outputs/ProportionMapUnitssampled_ESSFmc.png", 
+                          width_pixels=270,
+                          height_pixels=120)
+  
+  trDat_sum.bgc1 <- trDat_sum.bgc %>% filter(bgc_cat == "ESSFmcw") %>% droplevels()
+  ss.ratio2 <- ggplot(trDat_sum.bgc1, aes(x = fct_reorder(target, prop, .desc = TRUE), y = prop,  label = target)) +
+  geom_bar( stat = "identity", colour = "white", size = .1) + 
+  theme(axis.text.x = element_text(angle = 0))+
+    scale_fill_grey()+
+  xlab("ESSFmcw")+
+      ylab("")+
+    ylim(0,0.5)+
+  theme_pem()+
+  theme(legend.position = "none")+
+  geom_text(aes(label=prop), vjust=0, size = 3)
+ss.ratio2
+
+  finalise_plot (ss.ratio2, "./PEM_standards_manuscripts/outputs/ProportionMapUnitssampled_ESSFmcw.png", 
+                          width_pixels=270,
+                          height_pixels=120)
+```
+
+
+```{r load data, echo = FALSE, include = TRUE}
+#fwrite(trDat_sum.bgc,"../PEM_standards_manuscripts/outputs/mapunitproportions.csv"  )
+  # %>% mutate_if(is.character, as.factor) %>% fct_explicit_na(target, na_level = "Other")
+unitratio_table <- formattable(trDat_sum.bgc1)
+#export_formattable(unitratio_table ,"../Deception_AOI/results/MapUnitRatioTable2.png", width = "40%")
+
+transect.summary <- as.data.frame(trDat_sum.bgc)
+transect.summary_flex <- flextable(transect.summary) %>% autofit()# %>%  align(align = "center", part = "all") %>% set_table_properties(width = .5, layout = "autofit")
+#print(rich_tab1_flex, preview = "docx")
+transect.summary_flex <- autofit(transect.summary_flex)
+transect.summary_flex
+save_as_docx(transect.summary_flex , path = "./PEM_standards_manuscripts/outputs/MapUnitSummary2.docx")
+
+##lump together rare units into "Other" Category
+trDat_sum.bgc2 <- trDat_sum.bgc %>% mutate(target_lump = ifelse(prop<.03, "Other", target))
+  trDat_sum.bgc2 <- trDat_sum.bgc2 %>%
+  dplyr::group_by(bgc_cat, target_lump) %>%
+  dplyr::summarise(prop_sum = sum(prop)) %>% 
+    mutate(target_lump = factor(target_lump)) %>% 
+    mutate(fct_reorder(target_lump, prop_sum, .desc = FALSE))
+
+ss.ratio <- ggplot(trDat_sum.bgc2, aes(x = bgc_cat, y = prop_sum, fill = fct_reorder(target_lump, prop_sum), label = target_lump)) +
+  geom_bar(position = "stack", stat = "identity", colour = "white", size = .1) + 
+  #coord_flip()+
+  theme(axis.text.x = element_text(angle = 0))+
+    scale_fill_grey()+
+  xlab("BGC")+
+  ylab("Proportion of Sample Transects")+
+  #xlimit
+  theme_pem()+
+geom_text(size = 4, position = position_stack(vjust =.5), colour = "black")+
+  theme(legend.position = "none")
+          
+
+#ggsave("../Deception_AOI/results/ProportionMapUnitssampled.jpg", dpi = 300, width = 6, height = 4, units = "in")
+
+ss.ratio
+  finalise_plot (ss.ratio, "./PEM_standards_manuscripts/outputs/ProportionMapUnitssampled.png", 
+                          width_pixels=360,
+                          height_pixels=360)
+  
+
+```
+
+
+```{r, include = TRUE, echo = FALSE}
+# format data for model by removing covars with NA values 
+
+trDat_all <- 
+      tpts %>% dplyr::select(bgc_cat, slice, tid, transect_id, target)  %>% filter(!is.na(target), !target == "") %>% 
+  dplyr::rename(site = tid, transect = transect_id, bgc = bgc_cat)
+
+
+#trDat#[complete.cases(trDat[ , 5:length(trDat)]),]
+  
+# create a subset of data by removing any variables not in model (required for model to run without error) 
+# trDat <- trDat_all %>%
+#     dplyr::select(-c(target2, tid, bgc_cat))
+  
+```
+
+## Map unit ratio by sample units
+
+```{r prepare data, include = TRUE, echo = TRUE}
+# 3: set up preparation of data sets 
+BGCDat <- trDat_all  %>% mutate_if(is.character, as.factor) %>% mutate_if(is.integer, as.numeric)# %>% filter(bgc == "SBSmc2")
+slices <- unique(BGCDat$slice) %>% droplevels()
+bgcs <- unique(BGCDat$bgc) %>% droplevels()
+sites <- unique(BGCDat$site) %>% droplevels()
+trans<- unique(BGCDat$transect) %>% droplevels()
+
+sumbyslice <-
+  foreach(l=bgcs, .combine='rbind') %:%
+    foreach(k=slices, .combine='rbind', .inorder=FALSE) %dopar% {
+      BGC_train <- BGCDat %>% filter(!slice %in% k, !bgc %in% l) %>% dplyr::select(-slice, -bgc) %>% droplevels()
+BGC_test <- BGCDat %>% filter(slice %in% k, bgc %in% l) %>% dplyr::select(-slice, -bgc)
+
+trDat_sum <- BGC_test %>%
+  dplyr::group_by(target) %>%
+  summarise(freq = n()) %>%
+  mutate(prop = round(freq/sum(freq),3))
+trDat_sum$test_slice <- k
+trDat_sum$bgc <- l
+trDat_sum
+    }
+
+sumbyslice
+
+map.ratio.slice <- ggplot(sumbyslice, aes(target, freq)) +
+  geom_bar(stat = "identity") + 
+  theme(axis.text.x = element_text(angle = 90))+
+  facet_wrap (~test_slice)+
+  ggtitle("Ratio of Map units by slice")
+
+finalise_plot (map.ratio.slice , "../PEM_standards_manuscripts/outputs/Ratio_of_mapunits_by_slice.png", 
+                          width_pixels=360,
+                          height_pixels=360)
+#ggsave("ratio of all mapunits by slice.pdf", width = 20, height = 20, units = "cm")
+
+sumbysite <- 
+  foreach(l=bgcs, .combine='rbind') %:%
+    foreach(k=sites, .combine='rbind', .inorder=FALSE) %dopar% {
+      BGC_train <- BGCDat %>% filter(!site %in% k, !bgc %in% l) %>% dplyr::select(-slice, -site, -bgc) %>% droplevels()
+BGC_test <- BGCDat %>% filter(site %in% k, bgc %in% l) %>% dplyr::select(-slice, -bgc, -site)
+
+trDat_sum <- BGC_test %>%
+  dplyr::group_by(target) %>%
+  summarise(freq = n()) %>%
+  mutate(prop = round(freq/sum(freq),3))
+trDat_sum$test_site <- k
+trDat_sum$bgc <- l
+trDat_sum
+    }
+
+sumbysite
+map.ratio.site <- ggplot(sumbysite, aes(target, freq)) +
+  geom_bar(stat = "identity") + 
+  theme(axis.text.x = element_text(angle = 90))+
+  facet_wrap (~test_site)+
+  ggtitle("Ratio of Map units by sites")
+finalise_plot (map.ratio.site , "../PEM_standards_manuscripts/outputs/Ratio_of_mapunits_by_site.png", 
+                          width_pixels=360,
+                          height_pixels=360)
+#ggsave("ratio of all mapunits by site.pdf", width = 20, height = 20, units = "cm")
+
+sumbytrans <- 
+  foreach(l=bgcs, .combine='rbind') %:%
+    foreach(k=trans, .combine='rbind', .inorder=FALSE) %dopar% {
+      BGC_train <- BGCDat %>% filter(!transect %in% k, !bgc %in% l) %>% dplyr::select(-slice, -site, -bgc) %>% droplevels()
+BGC_test <- BGCDat %>% filter(transect %in% k, bgc %in% l) %>% dplyr::select(-slice, -bgc, -site)
+
+trDat_sum <- BGC_test %>%
+  dplyr::group_by(target) %>%
+  summarise(freq = n()) %>%
+  mutate(prop = round(freq/sum(freq),3))
+trDat_sum$test_trans <- k
+trDat_sum$bgc <- l
+trDat_sum
+    }
+
+sumbytrans
+map.ratio.trans <- ggplot(sumbytrans, aes(target, freq)) +
+  geom_bar(stat = "identity") + 
+  theme(axis.text.x = element_text(angle = 90))+
+  facet_wrap (~test_trans)+
+  ggtitle("Ratio of Map units by transect")
+finalise_plot (map.ratio.trans, "../PEM_standards_manuscripts/outputs/Ratio_of_mapunits_by_transect.png", 
+                          width_pixels=360,
+                          height_pixels=360)
+
+```
+
+```{r compare ratio of site series between slices}
+###JSD for all pairs
+require(harrietr)
+require(proxy)
+sumbyslice <- sumbyslice %>% filter(!target %in% "")
+byslice.mtx <- sumbyslice %>% pivot_wider(id_cols = c(bgc, test_slice),names_from = target, values_from = prop)# %>%  column_to_rownames('test_slice')
+k = "SBSmc2"
+sim.slice <- foreach(k %in% levels(sumbyslice$bgc), .combine = 'rbind') %do% {
+byslice <- byslice.mtx %>% filter(bgc == k) %>% dplyr::select(-bgc,-test_slice) %>% janitor::remove_empty(which = "cols") %>% replace(is.na(.),0)# %>% dplyr::select(1:9)
+Sim.slice <- proxy::dist(as.matrix(byslice), method = "ejaccard") %>% matrix %>% melt_dist()
+Sim.slice$bgc <- k
+Sim.slice$type <- 'slices'
+Sim.slice
+}
+# ggplot(sim.slice, aes(bgc, dist)) +
+#   geom_boxplot()
+
+sumbysite <- sumbysite %>% filter(!target %in% "")
+bysite.mtx <- sumbysite %>% pivot_wider(id_cols = c(bgc, test_site),names_from = target, values_from = prop)%>%  column_to_rownames('test_site')
+
+sim.site <- foreach(k %in% levels(sumbysite$bgc), .combine = 'rbind') %do% {
+bysite <- bysite.mtx %>% filter(bgc == k) %>% dplyr::select(-bgc) %>% janitor::remove_empty(which = "cols") %>% replace(is.na(.),0)# %>% dplyr::select(1:9)
+Sim.site <- proxy::dist(as.matrix(bysite), method = "ejaccard") %>% matrix %>% melt_dist()
+Sim.site$bgc <- k
+Sim.site$type <- 'sites'
+Sim.site
+}
+
+sumbytrans <- sumbytrans %>% filter(!target %in% "")
+bytrans.mtx <- sumbytrans %>% pivot_wider(id_cols = c(bgc, test_trans),names_from = target, values_from = prop) %>%  column_to_rownames('test_trans')
+
+sim.trans <- foreach(k %in% levels(sumbytrans$bgc), .combine = 'rbind') %do% {
+bytrans <- bytrans.mtx %>% filter(bgc == k) %>% dplyr::select(-bgc) %>% janitor::remove_empty(which = "cols") %>% replace(is.na(.),0)# %>% dplyr::select(1:9)
+Sim.trans <- proxy::dist(as.matrix(bytrans), method = "ejaccard") %>% matrix %>% melt_dist()
+Sim.trans$bgc <- k
+Sim.trans$type <- 'transects'
+Sim.trans
+}
+# ggplot(sim.site, aes(bgc, dist)) +
+#   geom_boxplot()
+
+sim.all <- rbind(sim.slice, sim.site, sim.trans)
+sim.all$type <- factor(sim.all$type, levels =c("slices", "sites", "transects"))
+summary_df <- sim.all %>% group_by(type) %>% summarize(m=mean(dist))
+
+samp.type.diss <- ggplot(sim.all, aes(type, dist)) +
+  geom_boxplot()+
+  xlab("Sample Unit type")+
+  ylab("Dissimilarity between Sample Units")+
+  theme_pem()+
+  geom_text(data=summary_df,
+    aes(y=m, label=round(m,2), group=type),
+    color='black', nudge_y = .04)
+
+samp.type.diss
+  
+finalise_plot (samp.type.diss, "../PEM_standards_manuscripts/outputs/Mapunit Dissimilarity between Sample Unit Types2.png",
+                          width_pixels=250,
+                          height_pixels=250)
+
+```
+
+### Calculate the number of forested site series in build by number of slices
+Could identify test sets without full site series complement to remove
+
+```{r, echo = FALSE, eval = FALSE}
+#tpts <- read.csv(file.path(onedrive,"loo","s1_clean_pts_all_fnf.csv")) 
+bgc <- c("sbsmc", "essfmc", "essfmcw")
+max_ss <- c(8, 9, 5)
+mapunits_mapped <- data.frame(bgc, max_ss)
+
+bgcoi_string = "sbsmc"
+allcomp_sbsmc <- read_csv(file.path(AOI_dir, "results", "num_slice_acc", "SBSmc2matrix.csv")) %>% mutate(bgc_cat = "sbsmc") %>% 
+  pivot_longer(cols = c(-bgc_cat, -slice, -slice_no), names_to = "names", values_to = "values")
+nSBS <- 8
+
+bgcoi_string = "essfmc"
+allcomp_essfmc <- read_csv(file.path(AOI_dir, "results", "num_slice_acc", "ESSFmcmatrix.csv")) %>% mutate(bgc_cat = "essfmc")%>% 
+  pivot_longer(cols = c(-bgc_cat, -slice, -slice_no), names_to = "names", values_to = "values")
+nESSF <- 9
+
+bgcoi_string = "essfmcw"
+allcomp_essfmcw <- read_csv(file.path(AOI_dir, "results", "num_slice_acc", "ESSFmcwmatrix.csv")) %>% mutate(bgc_cat = "essfmcw")%>% 
+  pivot_longer(cols = c(-bgc_cat, -slice, -slice_no), names_to = "names", values_to = "values")
+nESSFw <- 5
+
+allcomp <- rbind(allcomp_sbsmc, allcomp_essfmc, allcomp_essfmcw) %>% pivot_wider(id_cols = c(bgc_cat, slice, slice_no), names_from = names, values_from = values) %>% dplyr::select(V1, V2, V3, V4, V5, V6, everything())
+
+trDat2 <- tpts %>% 
+  #filter(str_detect(tid, bgcoi_string)) %>% # need to adjust this
+  mutate(slice = as.factor(slice), bgc_cat = as.factor(bgc_cat), target = as.factor(target), bgc_cat2 = as.factor(bgc_cat) ) 
+trDat2$bgc_cat <- recode_factor(trDat2$bgc_cat, "ESSFmc" = "essfmc", "SBSmc2" = "sbsmc", "ESSFmcw" = "essfmcw")
+ #trDat2 <- trDat2 %>% dplyr::select(bgc_cat,slice)%>% filter(bgc_cat %in% l)
+# trDatw <- trDatw 
+   l="sbsmc"; k=60
+n_mapunits <- foreach(l=unique(allcomp$bgc_cat), .combine='rbind') %:%
+  foreach(k = 1:nrow(filter(allcomp, bgc_cat == l)), .combine=rbind) %dopar% {
+
+   allcomp2 <- allcomp %>% filter(as.character(bgc_cat) %in% l) %>% dplyr::select(-slice, -bgc_cat) %>% droplevels()
+   max_ss <- mapunits_mapped %>% filter(bgc %in% l)
+
+   train_slice <- allcomp2[k,c(2:6)] %>% droplevels() %>% t() %>% na.omit()
+   test_slice <- allcomp2[k,1] %>% droplevels() %>% t()%>% na.omit()
+  # training set data
+  BGC_train <- trDat2 %>% filter(bgc_cat %in% l, slice %in% train_slice) %>% 
+    filter(is.na(mapunit2)) %>% filter(!is.na(target)) %>% droplevels() ## mapunit2 removed since only pure calls are used in model build
+  BGC <- unique(BGC_train$bgc_cat2) %>% as.character
+    BGC_train <-   BGC_train %>% filter(str_detect(mapunit1, BGC)) ### only looking at site series map classes
+  mapunit_no <- unique(BGC_train$mapunit1) %>%  length() %>% as.data.frame %>% rename(mapunit_no = 1)
+ 
+  BGC_test <- trDat2 %>% filter(slice %in% test_slice, bgc_cat %in% l) %>%    
+  filter(is.na(mapunit2)) %>% filter(!is.na(target)) %>% droplevels()
+  BGC_test <-   BGC_test %>% filter(str_detect(mapunit1, BGC))
+  mapunit_test <- length(unique(BGC_test$mapunit1)) %>% as.data.frame %>% rename(mapunit_test = 1) 
+
+  all <- rbind(BGC_test, BGC_train)
+  all_num <- length(unique(all$mapunit1)) #%>% as.data.frame %>% rename(mapunit_all = 1) 
+  
+  build_no <- allcomp2[k,]  %>% dplyr::select(slice_no) 
+  mapunit_count <- cbind(build_no, mapunit_no, mapunit_test, max_ss)
+  mapunit_count$bgc <- l
+  mapunit_count <- mapunit_count %>% mutate(all_no = all_num)
+   mapunit_count
+}
+#}
+# 
+n_mapunits$bgc <- as.factor(n_mapunits$bgc) %>% recode_factor("essfmc" = "ESSFmc", "essfmcw" = "ESSFmcw", "sbsmc" = "SBSmc2")
+#n_mapunits$bgc <- 
+n_mapunits <- n_mapunits %>% mutate(prop = (mapunit_no/max_ss)*100) %>% distinct()
+  
+numUnitsSampled <- ggplot(aes(y = prop, x = slice_no, group = slice_no), data = n_mapunits) +
+  #ggtitle(paste0(bgcoi_string)) +
+  geom_boxplot() +
+   xlab("Number of Slices in Analysis Set") + ylab("% Map units in Sample Set")+
+  #scale_y_continuous(expand = c(0, 0),  breaks= pretty_breaks()) +
+  ylim(40,105)+
+  facet_wrap(~bgc)+
+  theme_pem()
+numUnitsSampled
+finalise_plot (numUnitsSampled, "../PEM_standards_manuscripts/outputs/ProportionSiteSeries_by_NumSlices_Build.png",
+                          width_pixels=360,
+                          height_pixels=360)
+
+# ggsave("../PEM_standards_manuscripts/ESSFmc_UnitsperAnalysisSetSize.pdf")
+unitsSBS <- trDat2 %>% filter(bgc_cat == "sbsmc") %>% dplyr::select(target) %>% distinct()
+unitsESSF <- trDat2 %>% filter(bgc_cat == "essfmc") %>% dplyr::select(target) %>% distinct()
+unitsESSFw <- trDat2 %>% filter(bgc_cat == "essfmcw") %>% dplyr::select(target) %>% distinct()
+```
+

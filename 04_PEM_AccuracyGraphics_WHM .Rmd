@@ -1,0 +1,524 @@
+---
+title: "Accuracy graphics for Deception Test Case"
+output: html_document
+params:
+  outDir: "."
+  trDat: trDat
+  target: target
+  target2: target2
+  tid: tid
+  rseed: NA
+  infiles: infiles
+  mmu: mmu
+  mname: mname
+  field_transect: field_transect
+  
+---
+
+## This should be setup in a 4 deep loop
+1. i iterations of models. I don't think we need to worry about point reduction. We are using the test transect metrics. 
+        Effect of tp balancing, raw, smote .25/downsample 75, smote .5/down 50, smote .75/down 25, smote 1/down50
+2. j iterations of BGC
+3. k iterations of Train/Test slices leave one out (build 4 test 1. Further test of build 3 test 2, build 2 test 3, and build 1 test 4  for the ESSFmc and SBSmc2 only once inner loop optimization has occurred)
+4. for each iteration build cv model and predict test -> return accuracy metrics 
+Prepare directories
+
+```{r setup, include=FALSE}
+
+library(data.table)
+library(scales)
+library(cowplot)
+library(caret)
+library(sf)
+library(ranger)
+library(tidyverse)
+library(fasterize)
+library(stringr)
+library(dplyr)
+library(raster)
+library(terra)
+library(readxl)
+library(stars)
+library(stringr)
+library(foreach)
+library(tidymodels)
+library(themis)
+library(vip)
+require(stringi)
+require(R.utils)
+library(data.table)
+library(knitr)
+library(themis)
+library(ggplot2)
+library(gridExtra)
+library(janitor)
+require(magicfor) 
+require(ggpubr)
+require(ggthemes)
+require(viridis)
+require(viridisLite)
+require(philentropy)
+require(formattable)
+require(utils)
+#devtools::install_github("tidymodels/tune")
+#devtools::install_github("tidymodels/parsnip")
+
+
+```
+
+```{r session setup, tidy = TRUE, warning=FALSE}
+
+AOI <- "Deception"
+#AOI <- "BoundaryTSA"
+# set up file structure
+AOI_dir <- file.path(".", paste0(AOI,"_AOI"))
+cov_dir <- file.path(AOI_dir, "1_map_inputs", "covariates")
+shapes_dir <- file.path(AOI_dir, "0_raw_inputs", "base_layers")
+input_pnts_dir <- file.path(AOI_dir, "1_map_inputs", "trainingData")
+out_dir <- file.path(AOI_dir, "3_maps_analysis","models")
+results_dir <- file.path(AOI_dir, "results")
+paper_dir <- file.path("./PEM_standards_manuscripts/models/paper_all_var")
+# read in temp functions
+#source(here::here('_functions', 'model_gen.R'))
+#source(here::here('_functions', 'point_subsample.R'))
+#source(here::here('_functions', 'predict_map.R'))
+source(here::here('_functions', 'model_gen_tidy.R'))
+source(here::here('_functions', 'acc_metrix_WHM.R'))
+source(here::here('_functions', 'doc_theme_pem.R'))
+
+```
+
+```{r create comparative boxplots, echo = FALSE, eval = TRUE}
+#### best overall balanced models from training point balancing work
+### import best model accuracy data
+
+####___________________________comparison for rebalanced vs raw (with no extra points)
+acc1 <- fread(file.path(paper_dir, "ESSFmc", "noextra_balancing", "acc_ds_60_sm_0.5.csv")) %>% data.frame %>% replace(is.na(.), 0) %>%
+  mutate(balance = "rebalanced")
+acc2 <- fread(file.path(paper_dir, "ESSFmcw", "noextra_balancing", "acc_ds_20_sm_0.5.csv")) %>% data.frame %>% replace(is.na(.), 0)%>%
+  mutate(balance = "rebalanced")
+acc3 <- fread(file.path(paper_dir, "SBSmc2", "noextra_balancing", "acc_ds_40_sm_0.8.csv")) %>% data.frame %>% replace(is.na(.), 0) %>%
+  mutate(balance = "rebalanced")
+
+
+#
+acc4 <- fread(file.path(paper_dir, "ESSFmc", "noextra_balancing", "acc_raw.csv")) %>% data.frame %>% replace(is.na(.), 0) %>%
+  mutate(balance = "raw")
+acc5 <- fread(file.path(paper_dir, "ESSFmcw", "noextra_balancing", "acc_raw.csv")) %>% data.frame %>% replace(is.na(.), 0) %>%
+  mutate(balance = "raw")
+acc6 <- fread(file.path(paper_dir, "SBSmc2", "noextra_balancing", "acc_raw.csv")) %>% data.frame %>% replace(is.na(.), 0) %>%
+  mutate(balance = "raw")
+
+acc_all <- rbind(acc4, acc5, acc6, acc1, acc2, acc3)
+
+####comparison for rebalanced vs raw (with extrapoints) 
+# acc1 <- fread(file.path(paper_dir, "ESSFmc", "extrapts_balancing", "acc_ds_30_sm_0.8.csv")) %>% data.frame %>% replace(is.na(.), 0) %>% 
+#  mutate(balance = "rebalanced")
+# acc2 <- fread(file.path(paper_dir, "ESSFmcw", "extrapts_balancing", "acc_ds_50_sm_0.5.csv")) %>% data.frame %>% replace(is.na(.), 0) %>% 
+#  mutate(balance = "rebalanced")
+# acc3 <- fread(file.path(paper_dir, "SBSmc2", "extrapts_balancing", "acc_ds_30_sm_0.4.csv")) %>% data.frame %>% replace(is.na(.), 0) %>% 
+#  mutate(balance = "rebalanced")
+# 
+# acc4 <- fread(file.path(paper_dir, "ESSFmc", "extrapts_balancing", "acc_raw.csv")) %>% data.frame %>% replace(is.na(.), 0) %>% 
+#   mutate(balance = "raw")
+# acc5 <- fread(file.path(paper_dir, "ESSFmcw", "extrapts_balancing", "acc_raw.csv")) %>% data.frame %>% replace(is.na(.), 0) %>% 
+#    mutate(balance = "raw")
+# acc6 <- fread(file.path(paper_dir, "SBSmc2", "extrapts_balancing", "acc_raw.csv")) %>% data.frame %>% replace(is.na(.), 0) %>% 
+#    mutate(balance = "raw")
+# 
+# 
+# acc_all <- rbind(acc4, acc5, acc6, acc1, acc2, acc3)
+
+
+####___________________________comparison for standard points and extrapoints
+
+# acc1 <- fread(file.path(paper_dir, "ESSFmc", "extrapts_balancing", "acc_raw.csv")) %>% data.frame %>% replace(is.na(.), 0) %>% dplyr::filter(acc_type == "test_estimate")
+# acc1$balance = "extra"
+# 
+# acc2 <- fread(file.path(paper_dir, "ESSFmcw", "extrapts_balancing", "acc_raw.csv")) %>% data.frame %>% replace(is.na(.), 0) %>% dplyr::filter(acc_type == "test_estimate")
+# acc2$balance = "extra"
+# acc3 <- fread(file.path(paper_dir, "SBSmc2", "extrapts_balancing", "acc_raw.csv")) %>% data.frame %>% replace(is.na(.), 0) %>% dplyr::filter(acc_type == "test_estimate")
+# acc3$balance = "extra"
+# acc_all <- rbind(acc1, acc2, acc3)
+# 
+# acc4 <- fread("./Deception_AOI/3_maps_analysis/models/forest_non_forest/for_nfor_bgc/999/ESSFmc/acc_raw.csv") %>% data.frame %>% replace(is.na(.), 0) %>% dplyr::filter(acc_type == "test_estimate")
+# acc4$balance = "balanced"
+# 
+# acc5 <- fread("./Deception_AOI/3_maps_analysis/models/forest_non_forest/for_nfor_bgc/999/ESSFmcw/acc_raw.csv") %>% data.frame %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+# acc5$balance = "balanced"
+# acc6 <- fread("./Deception_AOI/3_maps_analysis/models/forest_non_forest/for_nfor_bgc/999/SBSmc2/acc_raw.csv") %>% data.frame %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+# acc6$balance = "balanced"
+# 
+# acc_all <- rbind(acc4, acc5, acc6, acc, acc2, acc3)
+
+acc_all <- rbind(acc4, acc5, acc6, acc1, acc2, acc3)
+noi <-  names(acc_all)[str_detect(names(acc_all),"_theta")]
+
+ 
+   acc_all <- acc_all %>%
+     mutate(bgc = factor(bgc), slice = factor(slice),  balance = factor(balance)) %>% 
+     dplyr::select(balance, bgc, slice, acc, kap, oob, noi)
+   
+noi2 <-  names(acc_all)[str_detect(names(acc_all),"_w")]   
+     
+acc_all <-    acc_all  %>% 
+     dplyr::select(-noi2) %>% 
+     mutate(across(where(is.numeric), ~ . *100)) %>% distinct() %>% 
+     mutate(OOB_inv = (100-oob),
+            MLaccuracy = acc,
+            #mcc = mcc *100,
+            kappa = kap) %>% 
+     dplyr::select(-oob, -acc, -kap) 
+
+    acc_all2 <- acc_all %>% 
+   pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+     distinct() %>% 
+  mutate(type = case_when(
+       accuracy_type %in% c("MLaccuracy", "OOB_inv",  "kappa", "mcc") ~ "0_machine",
+      str_detect(accuracy_type, "aspat_pa_") ~ "4_aspatial",
+      str_detect(accuracy_type, "^spat_p_") ~ "1_primary",
+       str_detect(accuracy_type, "^spat_pa_") ~ "2_p+alternate",
+       str_detect(accuracy_type, "^spat_paf_") ~ "3_fuzzy_p+a")) %>% 
+     filter(!is.na(type)) %>% filter(!accuracy_type == "slice") %>% 
+     mutate(accuracy_type = str_replace(accuracy_type, "theta1", "theta 1"),
+       accuracy_type = str_replace(accuracy_type, "aspat_pa_theta", "\u0398 "),
+       accuracy_type = str_replace(accuracy_type, "spat_paf_theta", "\u0398 "),
+       accuracy_type = str_replace(accuracy_type, "spat_pa_theta", "\u0398 "),
+       accuracy_type = str_replace(accuracy_type, "spat_p_theta", "\u0398 "))
+    #acc_all2 <- acc_all2 %>% dplyr::filter(bgc == "SBSmc2", balance == "rebalanced") %>% mutate(accuracy_type2 = as.factor(accuracy_type)) %>% droplevels()
+    
+  ###Create ggplot graphic
+           overall_acc <- ggplot(aes(y = value, x = accuracy_type, fill = balance ), data = acc_all2 ) + # fill = accuracy_type2
+     geom_boxplot() +
+     scale_fill_brewer(type = "qual") +
+     facet_grid(bgc ~ type, labeller = labeller(type = 
+                                             c("0_machine" = "machine",
+                                               "1_primary" = "primary",
+                                               "2_p+alternate" = "alternate",
+                                               "3_fuzzy_p+a" = "fuzzy",
+                                               "4_aspatial" = "proportional (p+a)")), scales = "free_x")+
+     #facet_wrap(~acc_type)+
+     #geom_jitter(position=position_jitter(width=.1), colour = "grey", alpha = 0.8) + 
+     geom_hline(yintercept = 65,linetype ="dashed", color = "black") + 
+      theme_pem_facet() +
+       #scale_fill_manual(values=c("grey90", "grey70", "grey50"))+
+     theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position="none") +
+     xlab("Metric") + ylab("Accuracy") + 
+     ylim(25, 100)
+
+   
+   overall_acc
+   
+   finalise_facet_plot(overall_acc, "./PEM_standards_manuscripts/outputs/accuracy_raw_vs_balance_no_extras_25limit.png", width_pixels=480,
+                          height_pixels=480)
+   
+      #finalise_facet_plot(overall_acc, "./PEM_standards_manuscripts/outputs/accuracy_for_ppt.png", width_pixels=480,                        height_pixels=480)
+```
+
+
+```{r old, echo = FALSE, eval = TRUE}
+# acc_tab <- acc_theta_raw2 %>%  dplyr::select(-slice, -type) %>% mutate(accuracy_type = factor(accuracy_type)) %>%   
+   #   group_by(bgc, balance, accuracy_type) %>%
+   #   summarise(mean = mean(value))
+  #   group_by(bgc, balance, slice) #%>%
+  #    #dplyr::summarise(across(everything(), ~ mean(., is.na(.), 0)))
+  # 
+  # 
+  # acc_theta <- acc_all %>%
+  #   group_by(bgc, balance,slice) %>%
+  #   mutate(no.classes = length(unique(target))) %>%
+  #   ungroup() %>% 
+  #   mutate(primary_theta.5 = spat_p_theta.5*100,
+  #          p_alternate_theta.5 = spat_pa_theta.5*100,
+  #          p_a_fuzzy_theta.5 = spat_paf_theta.5*100,
+  #          primary_theta0 = spat_p_theta0*100,
+  #          p_alternate_theta0 = spat_pa_theta0*100,
+  #          p_a_fuzzy_theta0 = spat_paf_theta0*100,
+  #          primary_theta.1 = spat_p_theta1*100,
+  #          p_alternate_theta.1 = spat_pa_theta1*100,
+  #          p_a_fuzzy_theta.1 = spat_paf_theta1*100,
+  #           #aspatial_theta.5 = theta_wt *  (min(pred.tot,trans.tot)/trans.tot),
+  #           #aspatial_theta0 = raw_wt *  (min(pred.tot,trans.tot)/trans.tot),
+  #         # aspatial_theta.1 = mean_wt *  (min(pred.tot,trans.tot)/trans.tot),
+  #           aspatial_fpa_theta.5 = aspat_p_theta.5*100,
+  #           aspatial_fpa_theta0 = aspat_fpa_theta0*100,
+  #          aspatial_fpa_theta.1 = aspat_fpa_theta1*100)
+  # 
+  # 
+  # noi <-  names(acc_theta)[str_detect(names(acc_theta),"_theta")]
+  # 
+  #  acc_theta_target <- acc_theta %>%
+  #   dplyr::select(bgc, target, balance,slice, all_of(noi))
+  # 
+  # acc_theta <- acc_theta %>%
+  #   dplyr::select(bgc, balance,slice, all_of(noi))
+  # 
+  # acc_theta[is.na(acc_theta)] <- 0
+  # 
+  #  acc_theta_raw <- acc_theta %>%
+  #    mutate(bgc = factor(bgc), slice = factor(slice), balance = factor(balance)) %>% 
+  #   group_by(bgc, balance, slice) #%>%
+  #    #dplyr::summarise(across(everything(), ~ mean(., is.na(.), 0)))
+  #  
+  # # acc_theta_raw <- acc_theta_raw %>%
+  # #   dplyr::select(slice, all_of(noi)) %>% distinct()
+  # #    
+  #  ML_acc <- acc_all %>% dplyr::select(bgc, balance, slice, acc,  oob, kap) %>% 
+  #    mutate(OOB_inv = (1-oob)*100,
+  #           MLaccuracy = acc *100,
+  #           #mcc = mcc *100,
+  #           kappa = kap * 100) %>% 
+  #    dplyr::select(-oob, acc) %>% distinct() #%>% filter(bgc == "SBSmc2", balance == "rebalanced")
+  #  
+  #  acc_theta_raw2 <- merge(acc_theta_raw, ML_acc, by.x = c("bgc" ,"balance", "slice")) %>% mutate(slice = factor(slice), bgc = factor(bgc), balance = factor(balance)) %>% 
+  #  pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+  #    distinct() %>% 
+  #    mutate(type = case_when(
+  #      accuracy_type %in% c("MLaccuracy", "OOB_inv",  "kappa", "mcc") ~ "0_machine",
+  #     str_detect(accuracy_type, "aspatial") ~ "4_aspatial",
+  #     str_detect(accuracy_type, "primary") ~ "1_primary",
+  #      str_detect(accuracy_type, "alternate") ~ "2_p+alternate",
+  #      str_detect(accuracy_type, "fuzzy") ~ "3_fuzzy_p+a")) %>% 
+  #    filter(!is.na(type)) %>% filter(!accuracy_type == "slice") %>% 
+  #    mutate(accuracy_type = str_replace(accuracy_type, "theta.1", "theta 1"),
+  #      accuracy_type = str_replace(accuracy_type, "primary_theta", "\u0398 "),
+  #      accuracy_type = str_replace(accuracy_type, "p_alternate_theta", "\u0398 "),
+  #      accuracy_type = str_replace(accuracy_type, "p_a_fuzzy_theta", "\u0398 "),
+  #      accuracy_type = str_replace(accuracy_type, "aspatial_fpa_theta", "\u0398 "))
+  #  #   )) %>%
+  #  
+   # 
+   #   overall_acc <- ggplot(aes(y = value, x = accuracy_type, fill = balance), data = acc_theta_raw2) + #fill = accuracy_type
+   #   geom_boxplot() +
+   #   scale_fill_brewer(type = "qual") +
+   #   facet_grid(bgc ~ type, labeller = labeller(type = 
+   #                                           c("0_machine" = "machine",
+   #                                             "1_primary" = "primary",
+   #                                             "2_p+alternate" = "alternate",
+   #                                             "3_fuzzy_p+a" = "fuzzy",
+   #                                             "4_aspatial" = "aspatial")), scales = "free_x")+
+   #   #facet_wrap(~acc_type)+
+   #   #geom_jitter(position=position_jitter(width=.1), colour = "grey", alpha = 0.8) + 
+   #   geom_hline(yintercept = 65,linetype ="dashed", color = "black") + 
+   #    theme_pem_facet() +
+   #     scale_fill_manual(values=c("grey90", "grey70", "grey50"))+
+   #   theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position="none") +
+   #   xlab("Metric") + ylab("Accuracy") + 
+   #   ylim(-0.05, 100)
+   # 
+   # 
+   # overall_acc
+   # 
+   # finalise_facet_plot(overall_acc, "./PEM_standards_manuscripts/outputs/accuracy_raw_vs_balance_no_extras.png", width_pixels=480,
+   #                        height_pixels=480)
+   # 
+   # acc_tab <- acc_theta_raw2 %>%  dplyr::select(-slice, -type) %>% mutate(accuracy_type = factor(accuracy_type)) %>%   
+   #   group_by(bgc, balance, accuracy_type) %>%
+   #   summarise(mean = mean(value))
+
+#ggsave()
+```
+Run this to identify mapunits with low accuracy and so extra points should be acquired for that test.
+
+```{r same but by individual mapunit rather than theta for single accuracy run}
+acc_all <- fread("./Deception_AOI/3_maps_analysis/models/forest_non_forest/for_nfor_bgc/999/ESSFmcw/extrapts/acc_raw.csv") %>%   dplyr::select(unique(colnames(.)))%>% replace(is.na(.), 0) %>% dplyr::filter(acc_type == "test_estimate")
+
+acc_all <- acc_all %>%
+    dplyr::select(bgc,target,slice, transect_no,target, spat_fpa_unit_pos,aspat_fpa_unit_pos)
+                  #spat_p_unit_pos, spat_pa_unit_pos,   aspat_p_unit_pos, aspat_pa_unit_pos, )
+
+  acc_theta_target <- acc_all %>%
+    group_by(bgc, slice, target) %>%
+    mutate(no.classes = length(unique(target))) %>%
+    ungroup()
+  
+ # acc_theta_target[is.na( acc_theta_target)] <- 0
+  
+   acc_theta_raw <- acc_theta_target  %>% 
+     mutate(bgc = factor(bgc), slice = factor(slice), target = factor(target)) %>% 
+    group_by(bgc, slice, target) %>%
+     dplyr::summarise(across(everything(), ~ sum(., is.na(.), 0)))
+   
+
+   acc_theta_raw2 <- acc_theta_raw %>% 
+   pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+     distinct() %>% 
+    filter(!accuracy_type == "no.classes") %>% filter(!accuracy_type == "transect_no")
+
+ 
+     overall_acc <- ggplot(aes(y = value, x = target, fill = accuracy_type), data = acc_theta_raw2) + 
+     geom_boxplot() +
+     scale_fill_brewer(type = "qual") +
+     # facet_grid(bgc ~ type, labeller = labeller(type = 
+     #                                         c("0_machine" = "machine",
+     #                                           "1_primary" = "primary",
+     #                                           "2_p+alternate" = "alternate",
+     #                                           "3_fuzzy_p+a" = "fuzzy",
+     #                                           "4_aspatial" = "transect")), scales = "free_x")+
+     #facet_wrap(~acc_type)+
+     #geom_jitter(position=position_jitter(width=.1), colour = "grey", alpha = 0.8) + 
+     geom_hline(yintercept = .65,linetype ="dashed", color = "black") + 
+      theme_pem_facet() +
+       #scale_fill_manual(values=c("grey90", "grey50"))+
+     theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position="none") +
+     xlab("Metric") + ylab("Accuracy") + 
+     ylim(-0.05, 1)
+
+   
+   overall_acc
+   
+   finalise_facet_plot(overall_acc, "./Deception_AOI/results/UnitAccuracyMetrics_boxplot.png", width_pixels=480,
+                          height_pixels=480)
+   
+   # acc_tab <- acc_theta_raw2 %>%  dplyr::select(-slice, -type) %>% mutate(accuracy_type = factor(accuracy_type)) %>%   
+   #   group_by(bgc, balance, accuracy_type) %>%
+   #   summarise(mean = mean(value))
+```
+
+```{r compare balancing}
+
+# ##predictions from raw data model
+#   acc_raw <- fread("H:/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc/87/SBSmc2/acc_raw.csv") %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+# acc_raw$balance = "0_raw"
+#   acc_max <- fread("H:/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc/87/SBSmc2/acc_ds_80_sm_0.2.csv") %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+#   acc_max$balance = "1_max"
+#   acc_avr <- fread("H:/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc/87/SBSmc2/acc_ds_15_sm_0.5.csv") %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+#   acc_avr$balance = "2_mean"
+#   
+#   acc_bal <- rbind(acc_raw, acc_max, acc_avr)
+#     acc_bal$bgc = "SBSmc2"
+#      acc_bal <-   acc_bal %>%  dplyr::select(bgc, balance, slice, target, spat_fpa.x, trans.tot, trans.sum) %>% rename("spat_fpa" = "spat_fpa.x")
+# 
+#   
+#     acc_raw <- fread("H:/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc/87/ESSFmc/acc_raw.csv") %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+# acc_raw$balance = "0_raw"
+#   acc_max <- fread("H:/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc/87/ESSFmc/acc_ds_40_sm_0.6.csv") %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+#   acc_max$balance = "1_max"
+#   acc_avr <- fread("H:/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc/87/ESSFmc/acc_ds_15_sm_0.2.csv") %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+#   acc_avr$balance = "2_mean"
+#   
+#   acc_bal2 <- rbind(acc_raw, acc_max, acc_avr)
+#   acc_bal2$bgc = "ESSFmc"
+#   
+#    acc_bal2 <-  acc_bal2 %>%  dplyr::select(bgc, balance, slice, target, spat_fpa, trans.tot, trans.sum)
+#   
+#     acc_raw <- fread("H:/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc/87/ESSFmcw/acc_raw.csv") %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+# acc_raw$balance = "0_raw"
+#   acc_max <- fread("H:/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc/87/ESSFmcw/acc_ds_40_sm_0.8.csv") %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+#   acc_max$balance = "1_max"
+#   acc_avr <- fread("H:/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc/87/ESSFmcw/acc_ds_15_sm_0.6.csv") %>% replace(is.na(.), 0) %>% filter(acc_type == "test_estimate")
+#   acc_avr$balance = "2_mean"
+#   
+#   acc_bal3 <- rbind(acc_raw, acc_max, acc_avr)
+#   acc_bal3$bgc = "ESSFmcw"
+#   
+#    acc_bal3 <-  acc_bal3 %>%  dplyr::select(bgc, balance, slice, target, spat_fpa, trans.tot, trans.sum)
+#   acc_bal_all <- rbind(acc_bal, acc_bal2, acc_bal3)
+#   
+#   acc_theta <- acc_bal_all %>%
+#     group_by(bgc, balance, slice) %>%
+#     mutate(no.classes = length(unique(target))) %>%
+#     ungroup()
+#   
+#   # calculate the theta_spat_p
+#   theta = 0.5
+#   acc_theta <- acc_theta %>%
+#     rowwise() %>%
+#     mutate(theta_wt = (theta * (1/no.classes) + (1-theta) * (trans.tot/trans.sum))*100) %>%
+#     mutate(raw_wt = (trans.tot/trans.sum)*100) %>%
+#     mutate(mean_wt = (1/no.classes)*100) %>%
+#     mutate(theta.5 = theta_wt *  (spat_fpa/trans.tot),
+#            theta0 = raw_wt *  (spat_fpa/trans.tot),
+#            theta.1 = mean_wt *  (spat_fpa/trans.tot))
+# 
+#   noi <-  names(acc_theta)[str_detect(names(acc_theta),"theta")]
+#   
+#   acc_theta <- acc_theta %>%
+#     dplyr::select(bgc, balance, slice, all_of(noi))# %>% distinct()
+#   
+#   
+#    acc_theta_raw <- acc_theta %>%
+#     group_by(bgc, balance, slice) %>%
+#      summarise(across(everything(), ~ sum(., is.na(.), 0)))
+#    
+#    acc_theta_raw2 <- acc_theta_raw %>% mutate(slice = factor(slice), bgc = factor(bgc), balance = factor(balance) ) %>% 
+#    pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+#      distinct() %>% 
+#      mutate(type = factor(accuracy_type)) %>% 
+#      filter(!type == "theta_wt")# %>% 
+#      #mutate(accuracy_type = str_replace(accuracy_type, 'theta', '$/theta'))
+#             
+#    overall_acc <- ggplot(aes(y = value, x = type), data = acc_theta_raw2) + 
+#      geom_boxplot() +
+#      scale_fill_brewer(type = "qual") +
+#      facet_grid(bgc ~ balance, labeller = labeller(balance = 
+#                                              c("0_raw" = "raw",
+#                                                "1_max" = "theta = 0 optimized",
+#                                                "2_mean" = "theta = 1 optimized")), scales = "free_x")+
+#      #facet_wrap(~acc_type)+
+#      #geom_jitter(position=position_jitter(width=.1), colour = "grey", alpha = 0.8) + 
+#      geom_hline(yintercept = 65,linetype ="dashed", color = "black") + 
+#      #ggtitle("Map accuracy metrics by biogeoclimatic units from raw training data") + 
+#      theme_pem_facet() +
+#      theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+#      xlab("Mapunit") + ylab("Accuracy") + 
+#      ylim(-0.05, 100)
+# 
+#    
+#    overall_acc
+#    
+#    finalise_facet_plot(overall_acc, "./Deception_AOI/results/BalancedAccuracyMetrics_boxplot.png", width_pixels=640,
+#                           height_pixels=450)
+
+```
+
+
+## Accuracy per mapunit
+
+We can compare map unit accuracy levels to assess under or acceptable performance per map units. 
+
+```{r generate accuracy by mapunit, echo = FALSE, eval = TRUE}
+
+# mapunit_tot <- bsRes %>% 
+#   dplyr::filter(acc_type == "test_estimate") %>%
+#   group_by(slice, target, acc_type) %>%
+#   dplyr::select(mu_spat_p_acc, mu_spat_fp_acc, mu_spat_pa_acc, mu_spat_fpa_acc, unit_pos)%>%
+#   rowwise() %>%
+#   # mutate(spat_p_tot = (spat_p/trans.tot) *100,
+#   #        spat_pa_tot = (spat_pa/trans.tot) *100,
+#   #        spat_fp_tot = (spat_fp/trans.tot)*100,
+#   #        spat_fpa_tot = (spat_fpa/trans.tot)*100,
+#   #        aspat_p = unit_pos *100) %>%
+#   # dplyr::select(slice, target, spat_p_tot,
+#   #               spat_pa_tot, spat_fp_tot, spat_fpa_tot, aspat_p) %>%
+#   pivot_longer(., cols = where(is.numeric), names_to = "type") %>% 
+#    filter(!is.na(type)) %>% filter(!type == "slice")
+#          
+# mapunit_tot$type <- as.factor(mapunit_tot$type) %>% 
+#   factor(levels = c('mu_spat_p_acc', 'mu_spat_pa_acc','mu_spat_fp_acc',  'mu_spat_fpa_acc', 'unit_pos'))
+# 
+# MU_accuracy <- ggplot(aes(y = value, x = target, fill = type), data = mapunit_tot) + 
+#    geom_boxplot() + 
+#    #facet_wrap(~acc_type) + 
+#    geom_hline(yintercept = 65,linetype ="dashed", color = "red") + 
+#    ggtitle(paste0("Test accuracy per mapunit_", bgcs)) + 
+#    theme(axis.text.x = element_text(angle = 90)) +
+#    xlab("Mapunit") + ylab("Accuracy") + 
+#    ylim(-0.01, 1)+
+#    scale_fill_discrete(name = "Accuracy Metric", labels = c("Primary", "Primary/Alt", "Fuzzy Primary", "Fuzzy Primary/Alt", "Aspatial Unit Positive"))+
+#   geom_hline(yintercept = .65, colour = "red", linetype = "dashed")+
+#   theme_light()
+# 
+# MU_accuracy 
+# 
+# ggsave(paste0("./Deception_AOI/results/", bgcs, "_MU_AccuracyMetrics_boxplot_1.jpg"))
+# 
+# ```
+# ```{r read in existing graphic files and arrange}
+# rl = lapply(sprintf("my_viz%i.png", 1:4), png::readPNG)
+# gl = lapply(rl, grid::rasterGrob)
+# gridExtra::grid.arrange(grobs=gl)
+```
+
+
+
