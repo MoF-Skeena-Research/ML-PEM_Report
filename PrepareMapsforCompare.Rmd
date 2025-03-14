@@ -1,0 +1,94 @@
+---
+title: "Compare Maps"
+author: "WHMackenzie"
+date: "2025-02-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(tidyverse)
+require(ggplot2)
+require(data.table)
+require(sf)
+require(terra)
+require(tictoc)
+require(gt)
+
+```
+## Import old exPEM and TEM maps and crop mlPEM for comparative map unit summaries
+### align mlPEM to TEM
+```{r align mlPEM to TEM}
+file_path <- "./inputs/Deception_mlPEM_2022.gpkg"
+mlPEM <- vect(file_path)
+##to be used as template for AA calculation
+bgcs <- vect("./inputs/bec.gpkg")
+bgcs <- subset(bgcs, bgcs$MAP_LABEL %in% c("ESSFmc","SBSmc2", drop=FALSE))
+plot(bgcs)
+mlPEM2 <- terra::crop(mlPEM, bgcs)
+mlPEM3 <- terra::mask(mlPEM2, bgcs)
+plot(mlPEM3)
+writeVector(mlPEM3, "./outputs/mlPEM_in_TEM_area.gpkg", overwrite=TRUE)
+file_path <- "./PEM_standards_manuscripts/maps/TEMBapid4511_Deception.gpkg"
+TEM <- vect(file_path)
+## crop TEM to mlPEM area
+outline_mlPEM <- aggregate(mlPEM3)
+shared_TEM <- terra::crop(TEM,outline_mlPEM)
+polygon_areas <- expanse(shared_TEM)
+shared_TEM$area <- polygon_areas
+writeVector(shared_TEM,"./outputs/TEM_in_Deception.gpkg", overwrite = TRUE)
+polygon_areas <- expanse(TEM)
+TEM$area <- polygon_areas
+#writeVector(TEM,"./outputs/TEM_Deception.gpkg")
+TEM_poly_area <- values(TEM)
+fwrite(TEM_poly_area, "./outputs/TEM_polygon_areas.csv")##export for later summarizing
+outline_TEM <- aggregate(TEM)
+shared_TEM <- terra::crop(mlPEM3,outline_TEM)
+mlPEM3 <- terra::mask(mlPEM3, bgcs)
+polygon_areas <- expanse(shared_TEM)
+shared_TEM$area <- polygon_areas
+writeVector(shared_TEM, "./outputs/mlPEM_in_TEM.gpkg", overwrite=TRUE)
+plot(shared_TEM)
+```
+
+### align mlPEM to exPEM
+```{r align mlPEM to exPEM}
+bgcs <- vect("./inputs/bec.gpkg")
+bgcs <- subset(bgcs, bgcs$MAP_LABEL %in% c("ESSFmc","ESSFmcw", "SBSmc2", drop=FALSE))
+plot(bgcs)
+mlPEM3 <- terra::crop(mlPEM,bgcs)
+##---exPEM
+file_path <- "./PEM_standards_manuscripts/maps/Ex_PEM_Deception_fixed.gpkg"
+exPEM <- vect(file_path)
+outline_exPEM <- aggregate(exPEM)
+## crop mlPEM to exPEM area
+shared_PEM <- terra::crop(mlPEM3,outline_exPEM)
+polygon_areas <- expanse(shared_PEM )
+shared_PEM$area <- polygon_areas
+writeVector(shared_PEM, "./outputs/mlPEM_in_exPEM.gpkg", overwrite=TRUE)
+## crop exPEM to mlPEM area
+outline_mlPEM <- aggregate(shared_PEM)
+shared_PEM <- terra::crop(exPEM,outline_mlPEM)
+polygon_areas <- expanse(shared_PEM)
+shared_PEM$area <- polygon_areas
+writeVector(shared_PEM,"./outputs/exPEM_in_Deception.gpkg", overwrite = TRUE)
+plot(shared_PEM)
+```
+## Spatial join field transect data to exPEM for accuracy assessment
+```{r spatial overlay of exPEM and transects}
+## intersect allpts with exPEM.raster
+transects <- vect("./inputs/allpts.gpkg")
+transects_masked <- terra::mask(transects, shared_PEM)
+#transects_filtered <- transects_masked[transects_masked$Position == "Orig", ]
+#transects2 <- transects_filtered[, c("ID", "mapunit1", "mapunit2", "point_type", "transect_id", "tid", "slice")]
+head(transects_masked)
+#transects <- rasterize(transects, mlPEM.raster, field = "mapunit1")
+trans.exPEM <- intersect(transects_masked, shared_PEM)
+head(shared_PEM)
+trans.exPEM <- st_drop_geometry(trans.exPEM)
+keep <- c("ID", "Position", "BGC_LBL", "mapunit1", "mapunit2", "point_type", "transect_id", "tid", "slice", "ECOLBL_1", "MapUnit")
+trans.exPEM <- as.data.frame(trans.exPEM) %>% select(keep)
+fwrite(trans.exPEM, "./outputs/transects_in_exPEM.csv")
+
+```
+

@@ -1,0 +1,465 @@
+---
+title: "Machine Learning Model: tidyverse"
+output: html_document
+params:
+  outDir: "."
+  trDat: trDat
+  target: target
+  infiles: infiles
+  mmu: mmu
+  mname: mname
+  
+  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=FALSE,
+                      warning = FALSE, message = FALSE,
+                      results = 'show',
+                      eval = TRUE)  ## flag eval = false for quick text edits
+```
+
+```{r, echo=FALSE}
+## Load the data and parameters as specified in the R script (model_gen_tidy.R)
+
+trDat <- params$trDat
+target <- params$target
+infiles<- params$infiles
+mmu <- params$mmu
+mname <- params$mname
+outDir <- params$outDir
+
+library(data.table)
+library(knitr)
+library(cowplot)
+library(tidymodels)
+library(tidyverse)
+library(themis)
+library(ggplot2)
+library(janitor)
+ 
+ # Manual testing : option 
+# # 
+ # trDat = mpts          # load all bgc model data
+ #  target = "target"       # primary call or target column name
+ #   outDir = out_dir         # output file
+ #  indata = indata         # name of input data file for reporting
+ #    mmu = mmu               #
+ # mname = mname           # model name for reporting
+
+```
+
+
+This model uses the following parameters: 
+
+* **model reference:** `r params$mname` 
+* **mapunit:** `r mmu`
+* **training point set : **`r params$infiles`
+* **model response and covariates: ** `r names(trDat)`
+
+
+## Response variable: _`r target`_
+
+The following training points and frequency of points were used in the model. 
+
+```{r summary, echo = FALSE, include = TRUE}
+table(trDat[, target])
+
+# calculate summary of raw training data set
+trDat_sum <- trDat %>%
+  dplyr::group_by(target) %>%
+  dplyr::summarise(freq = n()) %>%
+  dplyr::mutate(prop = round(freq/sum(freq),3))
+
+ggplot(trDat, aes(target)) +
+  geom_bar() + 
+  theme(axis.text.x = element_text(angle = 90))+
+  theme_pem()+
+  scale_fill_discrete_sequential(palette = "Light Grays")
+
+```
+
+
+```{r cv and test loop, include = FALSE, echo = FALSE, eval =TRUE}
+trDat <- trDat %>% dplyr::select(-any_of(c("target2","tid", "bgc_cat", "slice")))
+
+trDat_all <- trDat[complete.cases(trDat[ , 2:length(trDat)]),]%>%
+    droplevels() 
+  
+trDat <- trDat_all 
+
+### split into train and test based on 5-site slices
+
+set.seed(123)
+uni_split <-  initial_split(trDat, 
+                              strata = target,
+                              prop = 0.75)
+  
+t_train <- training(uni_split)
+t_test <- testing(uni_split)
+
+
+# Set up recipe and run CV
+null_recipe <- recipe(target ~ ., data = t_train) #%>%
+    #step_downsample(target, under_ratio = 25) %>%
+    #step_smote(target, over_ratio = 1, neighbors = 2)    #prep()
+
+# set up CV
+  set.seed(345)
+  pem_cvfold <- vfold_cv(
+    t_train,
+    v = 3,
+    repeats = 5,#5,
+    #group = "tid",
+    strata = target
+  )
+  
+  randf_spec <- rand_forest(mtry = 10, min_n = 2, trees = 200) %>% 
+    set_mode("classification") %>%
+    set_engine("ranger", importance = "permutation", verbose = FALSE) 
+  
+  pem_workflow <- workflow() %>%
+    add_recipe(null_recipe) %>%
+    add_model(randf_spec)
+  
+  #######################################################
+  
+  set.seed(4556)
+  cv_results <- fit_resamples(pem_workflow,
+                              resamples = pem_cvfold,
+                              control = control_resamples(save_pred = TRUE))
+  
+  # collect metrics
+  cv_metrics <- cv_results  %>% collect_metrics(summarize = FALSE)
+  cv_metrics_sum <- cv_results %>% collect_metrics()
+  
+  # collect predictions
+  cv_pred_sum <- cv_results %>% collect_predictions(summarize = TRUE)
+  cv_pred_sum <- cv_pred_sum %>% dplyr::select(target, .pred_class)
+
+  ## CV model accuracy metrics
+  cv_pred_sum <- as.data.frame(cv_pred_sum)
+
+  cv_acc <- acc_metrix_nf(cv_pred_sum) %>%
+    mutate(acc_type = "cv_estimate")
+  
+  
+  ## build final train model and predict test data and compare acc_metrix to cv results
+  PEM_rf1 <- fit(pem_workflow, t_train)
+  final_fit <- extract_fit_parsnip(PEM_rf1) # %>%pull(.predictions)
+  
+  ######### Predict Test
+  test_target <- t_test %>% dplyr::select(target)
+  test.pred <-  predict(PEM_rf1, t_test)
+  test.pred <- cbind(test_target, test.pred) %>% 
+    mutate_if(is.character, as.factor)
+  
+  ###harmonize levels
+  targ.lev <- levels(test.pred$target)
+  pred.lev <- levels(test.pred$.pred_class)
+  levs <- c(targ.lev, pred.lev) %>% unique()
+  test.pred$target <- factor(test.pred$target, levels = levs)
+  test.pred$.pred_class <- factor(test.pred$.pred_class, levels = levs)
+     
+  test.acc <- acc_metrix_nf(test.pred) %>%
+       mutate(acc_type = "test_estimate")
+  
+  ## compare cv stats to test stats
+  acc.compare <- bind_rows(cv_acc, test.acc)
+  
+  #save( acc.compare , file = paste(paste0(".", outDir), "model_results.RData", sep = "/"))
+  #write.csv( acc.compare, file = paste(paste0("./", outDir), "acc_results.csv",sep = "/"))
+  #save(acc.compare, file = paste(paste0(".", outDir), "model_results.RData", sep = "/"))
+  #save(acc.compare , file = paste(outDir, "model_results.RData", sep = "/"))
+
+  write.csv(acc.compare, file = paste(paste0(".", outDir), "acc_results.csv",sep = "/"))
+ 
+  
+
+  ############### Define test recipes and workflow ###################
+  
+final_data <- trDat #%>% dplyr::select(-c(target2))
+
+final_recipe <-
+   recipe(target ~ ., data = final_data) #%>%
+  # update_role(tid, new_role = "id variable")
+#    step_dummy(forest_nonforest, one_hot = TRUE) %>%
+#    step_downsample(target, under_ratio = ds_ratio) %>%
+#    step_smote(target, over_ratio = sm_ratio, neighbors = 2)
+
+pem_workflow <- workflow() %>%
+    add_recipe(final_recipe) %>%
+    add_model(randf_spec)
+  
+PEM_final <- fit(pem_workflow, final_data)
+
+# write out model
+saveRDS(PEM_final, file = paste(paste0(".", outDir), "final_tmodel.RDATA",sep = "/"))
+saveRDS(PEM_final, file = paste(paste0(".", outDir), "final_tmodel.rds",sep = "/"))
+
+```
+
+
+## Test Accuracy metrics
+
+This table contains a mean and standard deviation of the bootstrapped test metrics.
+
+```{r final test results, include = TRUE, echo = FALSE, eval = TRUE}
+# confidence interval based on average prediction confus
+
+conf_matrix <- cv_pred_sum %>% 
+   conf_mat(target, .pred_class) %>%
+   pluck(1) %>%
+   as_tibble() %>%
+   ggplot(aes(Prediction, Truth, alpha = n)) +
+   geom_tile(show.legend = FALSE) +
+   geom_text(aes(label = n), colour = "black", alpha = 1, size = 3) + 
+   theme(axis.text.x = element_text(angle = 90)) + 
+   labs(main = "Example Test Confusion Matrix")
+    
+ conf_matrix
+ 
+```
+
+```{r variable importance, include = TRUE, echo = FALSE}
+### Variable importance plot
+
+# 1) basic model all covars 
+randf_final <- rand_forest(mtry = 20, min_n = 2, trees = 1000) %>%
+   set_mode("classification") %>%
+   #set_engine("ranger", importance = "permutation") 
+   set_engine("ranger", importance = "impurity") 
+
+trDat_final <- trDat# %>% dplyr::select(-c(target2))
+# update recipe with all data 
+
+vip_recipe <-
+    recipe(target ~ ., data = trDat_final) #%>%
+  #  update_role(tid, new_role = "id variable")#  %>%
+    #step_dummy(forest_nonforest, one_hot = TRUE) %>%
+    #step_downsample(target, under_ratio = ds_ratio) %>%
+    #step_smote(target, over_ratio = sm_ratio, neighbors = 2)
+
+# # calculate the final variable importance per model
+final_vip <- workflow() %>%
+   add_recipe(vip_recipe) %>%
+   add_model(randf_final) %>%
+   fit(trDat_final) 
+ 
+ # report final VIP oob - all values 
+#oob_final_vip  <- round(final_vip$fit$fit$fit$prediction.error, 3)
+#oob_final_vip 
+
+final_vip <- final_vip %>%
+   pull_workflow_fit() %>%
+   vip(num_feature = 40)
+
+final_vip
+
+```
+  
+
+```{r define models with tuning parameter option, echo = FALSE, eval= FALSE}
+# 2: Optional:  Perform model hyperparameter tuning (optional)   
+
+Select model and tune the parameters, note this is time consuming. Model tuning is performed the resampled data by splitting each fold into analysis and assessment components. For each candidate model we should retune the model to select the best fit. However due to the intense computation and time we will tune the model only once for each candidate model and check results with full 10 x 5 CV tuning. Tuning outputs are inspected to assess the best hyperparameters for the given model based on a chosen meaure of accuracy (ie accuracy, j_index, roc). Once the hyperparamters are selected we update the model and apply this to the entire resampled dataset.  Two methods are available
+
+
+
+randf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>%
+#randf_spec <- rand_forest(mtry = 20, min_n = 2, trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity") #or "permutations
+
+# mtry = how many leaves to you sample at each tree
+# trees = number of trees, just need enough
+# min_n = how many data points need to be in node before stop splitting
+
+pem_workflow <- workflow() %>%
+    add_recipe(uni_recipe) %>%
+    add_model(randf_spec)
+
+cv_metrics <- metric_set(accuracy, roc_auc, j_index)
+
+set.seed(345)
+pem_cvfold <- vfold_cv(trDat, 
+                          v = 10, 
+                          repeats = 3, 
+                          strata = target)
+
+
+# Two methods are available for tuning; 1) basic grid and 2) regular grid. 
+# For Random Forest we are using regular grid tune to assess hyperparameters. 
+
+# Tune the model
+# ##https://www.youtube.com/watch?v=ts5bRZ7pRKQ
+# https://www.tidymodels.org/start/case-study/
+# http://www.rebeccabarter.com/blog/2020-03-25_machine_learning/
+#install.packages("tictoc")
+
+library(tictoc)
+
+# # look at more bound options (ie c(2, 6, 10))
+ranger_tune_detail <-
+  grid_regular(
+    mtry(range = c(2, 40)),
+    min_n(range = c(2, 10)),
+    levels = 5)
+
+# # re-run the tuning with the explicit parameter sets
+tic()
+set.seed(4556)
+doParallel::registerDoParallel()
+ranger_tune <-
+  tune_grid(pem_workflow,
+            resamples = pem_cvfold,
+            #metrics = cv_metrics,
+            grid = ranger_tune_detail)
+toc()
+
+saveRDS(ranger_tune, file = paste(paste0(".", outDir), "parameter_tune_results.rds", sep = "/"))
+
+# explore ranger tune output
+ranger_tune %>%
+  dplyr::select(.metrics) %>%
+  unnest(cols = c(.metrics))
+
+# explore results of tuning models note different for type of model selected
+select_best(ranger_tune, metric = "accuracy")
+select_best(ranger_tune, metric = "roc_auc")
+#select_best(ranger_tune, metric = "j_index")
+
+autoplot(ranger_tune)
+
+# Plot the impact of different values for the hyperparamters. note these are randomly selected for the number of grids specified (ie. grid = 20).
+# This provides an overview of the impact of ech tune paramter. Note this provides an overview as we dont know what min_n was each mtry etc...
+# this can be used to set up the tune grid paramter
+
+ranger_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  dplyr::select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+               values_to = "value",
+               names_to = "parameter") %>%
+  ggplot(aes(value, mean, colour = parameter)) +
+  geom_point(show.legend = FALSE)+
+  facet_wrap(~parameter)
+
+
+# for the 30 m standard pt # minimal change in mtry after 5 - 10 
+# mtry = 10, min_n = 2
+
+```
+
+    
+## Overall accuracy. 
+
+The overall map accuracy was calculated but determining the percent correct for each map unit by comparing transect data (held-out slice).
+
+### Types of accuracy 
+Several types of accuracy measures were calculated;
+
+1) aspatial: this is equivalent to traditional AA where proportion of map units are compared. Aspatial_acc is the accuracy per slice (i.e total accuracy over the site). Aspatial_meanacc is the accuracy based on the average of map units (ie: 100% correct = 0% correct).
+
+2) spatial (spat_p): this compares spatial equivalents for the primary call for each pixal/point predicted.
+
+
+```{r, overall accuracy with confidence intervals, echo = FALSE, eval = TRUE}
+acc_sum <- acc.compare %>%
+    mutate(across(where(is.numeric), ~ replace_na(.,0))) %>%
+    dplyr::mutate(across(ends_with("overall"), ~.x *100)) %>%
+    dplyr::mutate(across(ends_with("meanacc"), ~.x *100)) %>%
+    dplyr::select(aspat_p_overall, aspat_p_meanacc, 
+                  spat_p_overall,  spat_p_meanacc,
+                  acc_type) %>%
+  distinct()
+  
+acc_sum_long <- acc_sum %>%
+    pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+  mutate(type = case_when(
+    str_detect(accuracy_type, "aspat") ~ "aspatial",
+    str_detect(accuracy_type, "spat") ~ "spatial"))  %>%
+  mutate(type_model = case_when(
+    str_detect(accuracy_type, "_overall") ~ "area-weighted",
+    str_detect(accuracy_type, "_meanacc") ~ "unweighted")) %>%
+  mutate(accuracy_type_label = case_when(
+    str_detect(accuracy_type, "_p_") ~ "p")) %>%
+  mutate(type_label = paste0(type, "_", type_model))
+
+
+# set up order for plots 
+acc_sum_long$type_f = factor(acc_sum_long$type_label, levels = c("spatial_area-weighted" ,"aspatial_area-weighted", "spatial_unweighted",  "aspatial_unweighted"))
+
+
+# plot both the cv and test metrics
+p2 <- ggplot(aes(y = value, x = type_f, fill = acc_type, color = acc_type), data = acc_sum_long ) + 
+   geom_point() +
+   #facet_wrap(~type_f, scales = "free_x", nrow = 2) +
+   geom_hline(yintercept = 65,linetype ="dashed", color = "black") + 
+   ggtitle("Accuracy measures (median + quartiles)") + 
+   xlab("Accuracy type") + ylab("Accuracy") + 
+   ylim(-0.05, 100)+
+   theme_pem_facet()#+ 
+   #scale_fill_discrete_sequential(palette = "Grays")
+
+p2
+
+
+```
+
+
+
+## Accuracy per mapunit
+
+We can compare map unit accuracy levels to assess under or acceptable performance per map units. 
+
+```{r generate overall mapunit, echo = FALSE, eval = TRUE}
+mu_acc <- acc.compare %>%
+    dplyr::select(target, acc_type, 
+                 aspat_p_unit_pos, 
+                 spat_p_unit_pos
+                  ) %>%
+  dplyr::filter(acc_type == "test_estimate") %>%
+  pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") 
+
+mu_acc <- mu_acc %>%
+  mutate(type = case_when(
+    str_detect(accuracy_type, "aspat") ~ "aspatial",
+    str_detect(accuracy_type, "spat") ~ "spatial")) %>%
+  mutate(type_model = case_when(
+    str_detect(accuracy_type, "_unit_pos") ~ "mapunit",
+    str_detect(accuracy_type, "_meanacc") ~ "unweighted")) %>%
+  mutate(accuracy_type_label = case_when(
+    str_detect(accuracy_type, "_p_") ~ "p",
+    str_detect(accuracy_type, "_pa_") ~ "pa",
+    str_detect(accuracy_type, "_fp_") ~ "fp",
+    str_detect(accuracy_type, "_pf_") ~ "fp",
+    str_detect(accuracy_type, "_fpa_") ~ "fpa")) %>%
+  mutate(type_label = paste0(type, "_", type_model))
+ 
+
+mu_unit <- mu_acc %>%
+  filter(type_model == "mapunit") %>%
+  dplyr::select(-c(acc_type, type_model ))
+
+## set up order for plots 
+#bsRes_temp$type_f = factor(bsRes_temp$type_label, levels = #c("spatial_overall","aspatial_overall", "spatial_average", "aspatial_average"))
+
+mu_unit$accuracy_type_label = factor(mu_unit$accuracy_type_label, levels = c("p","pa", "fp","fpa"))
+
+
+p4 <- ggplot(aes(y = value, x = target , fill = type,color = type), data = mu_unit  ) + 
+   geom_boxplot()+
+   #geom_jitter(aes(colour = type),width = 0.15) +
+  #facet_wrap(~target, scales = "free_x", nrow = 2) +
+   ggtitle("Mapunit accuracy measures ") + 
+   xlab("accuracy measure") + ylab("Proportion of Accurate calls") + 
+   ylim(-0.05, 1)+
+   theme_pem_facet()+ 
+   scale_fill_discrete_sequential(palette = "Light Grays")
+  
+
+p4
+
+```
