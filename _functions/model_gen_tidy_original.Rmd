@@ -1,0 +1,1141 @@
+---
+title: "Machine Learning Model: tidyverse"
+output: html_document
+params:
+  outDir: "."
+  trDat: trDat
+  target: target
+  target2: target2
+  tid: tid
+  rseed: NA
+  infiles: infiles
+  mmu: mmu
+  mname: mname
+  field_transect: field_transect
+  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=FALSE,
+                      warning = FALSE, message = FALSE,
+                      results = 'show',
+                      eval = TRUE)  ## flag eval = false for quick text edits
+```
+
+```{r, echo=FALSE}
+## Load the data and parameters as specified in the R script (model_gen_tidy.R)
+
+trDat <- params$trDat
+target <- params$target
+target2 <- params$target2
+tid <- params$tid
+infiles<- params$infiles
+mmu <- params$mmu
+mname <- params$mname
+field_transect <- params$field_transect
+outDir <- params$outDir
+
+library(data.table)
+library(knitr)
+library(cowplot)
+library(tidymodels)
+library(tidyverse)
+library(themis)
+library(ggplot2)
+library(gridExtra)
+library(janitor)
+
+# Manual testing : option 
+# 
+#  trDat = mpts          # load all bgc model data
+     trDat = inmdata_all   # load per bgc model data
+# # # # #
+     target = "target"       # primary call or target column name
+     target2 = "target2"
+     tid = "tid"             # transect_id column
+     outDir = outDir         # output file
+     indata = indata         # name of input data file for reporting
+     rseed = 456             # define seed to remove random nature of model
+     mmu = mmu               #
+     mname = mname           # model name for reporting
+     field_transect = all_points_predicted  # raw data for spatial assessment
+
+```
+
+This model uses the following parameters: 
+
+* **model reference:** `r params$mname` 
+* **mapunit:** `r mmu`
+* **training point set : **`r params$infiles`
+* **model response and covariates: ** `r names(trDat)`
+
+
+## Response variable: _`r target`_
+
+The following training points and frequency of points were used in the model. 
+
+```{r, echo = FALSE, include = TRUE}
+table(trDat[, target])
+
+# calculate summary of raw training data set
+trDat_sum <- trDat %>%
+  dplyr::group_by(target) %>%
+  summarise(freq = n()) %>%
+  mutate(prop = round(freq/sum(freq),3))
+
+ggplot(trDat, aes(target)) +
+  geom_bar() + 
+  theme(axis.text.x = element_text(angle = 90))
+
+```
+
+
+```{r, include = TRUE, echo = FALSE}
+# format data for model by removing covars with NA values 
+
+trDat_all <- trDat[complete.cases(trDat[ , 5:length(trDat)]),]
+  
+# create a subset of data by removing any variables not in model (required for model to run without error) 
+trDat <- trDat_all %>%
+    dplyr::select(-c(target2, tid, bgc_cat))
+  
+```
+
+Data pre-processing includes the following steps: 
+
+```{r split testing and training data, eval = FALSE}
+# 1: split into training and test data (0.75/0.25) training and testing 
+# not curretnly included but 
+
+set.seed(123)
+uni_split <-  initial_split(trDat, 
+                              strata = target,
+                              prop = 0.75)
+  
+t_train <- training(uni_split)
+t_test <- testing(uni_split)
+  
+```
+
+
+1: Set recipe
+
+```{r prepare data, include = TRUE, echo = TRUE}
+# 3: set up preparation of data sets 
+  
+uni_recipe <-
+    recipe(target ~ ., data =  trDat) %>%
+    #step_corr(all_numeric()) %>%        # remove correlated covariates
+    step_dummy(all_nominal(),-all_outcomes()) %>%    
+    step_smote(target) %>%
+    step_zv(all_numeric()) 
+
+uni_recipe_nosmote <-
+    recipe(target ~ ., data =  trDat) %>%
+    #step_corr(all_numeric()) %>%        # remove correlated covariates
+    step_dummy(all_nominal(),-all_outcomes()) %>%    
+    step_zv(all_numeric())
+
+# pre-processed training point data check 
+
+training_dat <- uni_recipe %>% prep() %>% juice()
+
+#table(training_dat$target)
+    
+ggplot(training_dat , aes(target)) +
+  geom_bar() + 
+  theme(axis.text.x = element_text(angle = 90))
+
+# note in RF as a tree based model it is not required to scale and normalize covariates and may have negative influence on the model performance 
+
+```
+
+2: Optional:  Perform model hyperparameter tuning (optional)   
+
+Select model and tune the parameters, note this is time consuming. Model tuning is performed the resampled data by splitting each fold into analysis and assessment components. For each candidate model we should retune the model to select the best fit. However due to the intense computation and time we will tune the model only once for each candidate model and check results with full 10 x 5 CV tuning. Tuning outputs are inspected to assess the best hyperparameters for the given model based on a chosen meaure of accuracy (ie accuracy, j_index, roc). Once the hyperparamters are selected we update the model and apply this to the entire resampled dataset.  Two methods are available
+
+```{r define models with tuning parameter option, echo = FALSE, eval= FALSE}
+# define model 
+
+randf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>%
+#randf_spec <- rand_forest(mtry = 20, min_n = 2, trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity") #or "permutations
+
+# mtry = how many leaves to you sample at each tree
+# trees = number of trees, just need enough
+# min_n = how many data points need to be in node before stop splitting
+
+pem_workflow <- workflow() %>%
+    add_recipe(uni_recipe) %>%
+    add_model(randf_spec)
+
+cv_metrics <- metric_set(accuracy, roc_auc, j_index)
+
+set.seed(345)
+pem_cvfold <- vfold_cv(trDat, 
+                          v = 10, 
+                          repeats = 3, 
+                          strata = target)
+
+
+# Two methods are available for tuning; 1) basic grid and 2) regular grid. 
+# For Random Forest we are using regular grid tune to assess hyperparameters. 
+
+# Tune the model
+# ##https://www.youtube.com/watch?v=ts5bRZ7pRKQ
+# https://www.tidymodels.org/start/case-study/
+# http://www.rebeccabarter.com/blog/2020-03-25_machine_learning/
+#install.packages("tictoc")
+
+library(tictoc)
+
+# # look at more bound options (ie c(2, 6, 10))
+ranger_tune_detail <-
+  grid_regular(
+    mtry(range = c(2, 40)),
+    min_n(range = c(2, 10)),
+    levels = 5)
+
+# # re-run the tuning with the explicit parameter sets
+tic()
+set.seed(4556)
+doParallel::registerDoParallel()
+ranger_tune <-
+  tune_grid(pem_workflow,
+            resamples = pem_cvfold,
+            #metrics = cv_metrics,
+            grid = ranger_tune_detail)
+toc()
+
+saveRDS(ranger_tune, file = paste(paste0(".", outDir), "parameter_tune_results.rds", sep = "/"))
+
+# explore ranger tune output
+ranger_tune %>%
+  dplyr::select(.metrics) %>%
+  unnest(cols = c(.metrics))
+
+# explore results of tuning models note different for type of model selected
+select_best(ranger_tune, metric = "accuracy")
+select_best(ranger_tune, metric = "roc_auc")
+#select_best(ranger_tune, metric = "j_index")
+
+autoplot(ranger_tune)
+
+# Plot the impact of different values for the hyperparamters. note these are randomly selected for the number of grids specified (ie. grid = 20).
+# This provides an overview of the impact of ech tune paramter. Note this provides an overview as we dont know what min_n was each mtry etc...
+# this can be used to set up the tune grid paramter
+
+ranger_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  dplyr::select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+               values_to = "value",
+               names_to = "parameter") %>%
+  ggplot(aes(value, mean, colour = parameter)) +
+  geom_point(show.legend = FALSE)+
+  facet_wrap(~parameter)
+
+
+# for the 30 m standard pt # minimal change in mtry after 5 - 10 
+# mtry = 10, min_n = 2
+
+```
+
+
+3: Set up cross validation
+
+```{r set-up cross validation, eval = TRUE}
+## set up cross validation for parameter tuning data sets # note cv best practice is 10 fold x 5 rep
+
+## Add blocking method
+## https://github.com/tidymodels/rsample/issues/32
+
+
+set.seed(345)
+pem_cvfold <- vfold_cv(trDat, 
+                          v = 10, 
+                          #repeats = 3, 
+                          strata = target)
+
+```
+
+
+4: Run CV metrics with updated hyperparameters
+
+```{r run model with tuned hyperparameters, echo = TRUE}
+#define the model with parameters to tune
+
+randf_spec <- rand_forest(mtry = 10, min_n = 2, trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity") #or "permutations
+
+pem_workflow <- workflow() %>%
+    add_recipe(uni_recipe) %>%
+    add_model(randf_spec)
+
+#cv_metric_set <- metric_set(accuracy, roc_auc, j_index, sens, spec)
+
+#doParallel::registerDoParallel() # note when smoting with fit_resample you cant use parrallel process or will cause error
+# cv_results <- fit_resamples(
+#   pem_workflow, 
+#   resamples = pem_cvfold, 
+#   #metrics = cv_metric_set, 
+#   control = control_resamples(save_pred = TRUE))
+
+set.seed(4556)
+cv_results <- fit_resamples(
+  randf_spec,  
+  uni_recipe,
+  resamples = pem_cvfold, 
+  #metrics = cv_metric_set, 
+  control = control_resamples(save_pred = TRUE))
+
+
+set.seed(4556)
+cv_results_nosmote <- fit_resamples(
+  randf_spec,  
+  uni_recipe_nosmote,
+  resamples = pem_cvfold, 
+  #metrics = cv_metric_set, 
+  control = control_resamples(save_pred = TRUE))
+
+
+
+```
+
+```{r collect metrics, echo = FALSE}
+
+# collect metrics  
+cv_metrics <- cv_results  %>% collect_metrics(summarize = FALSE)
+cv_metrics_sum <- cv_results %>% collect_metrics()
+
+# collect predictions
+cv_pred <- cv_results %>% collect_predictions(summarize = FALSE)
+cv_pred_sum <- cv_results %>% collect_predictions(summarize = TRUE)
+
+# collect metrics  
+cv_metrics2 <- cv_results_nosmote  %>% collect_metrics(summarize = FALSE)
+cv_metrics_sum2 <- cv_results_nosmote %>% collect_metrics()
+
+# collect predictions
+cv_pred2 <- cv_results_nosmote %>% collect_predictions(summarize = FALSE)
+cv_pred_sum2 <- cv_results_nosmote %>% collect_predictions(summarize = TRUE)
+
+
+
+ acc_bal <- bal_accuracy(cv_pred_sum2, target, .pred_class)
+ ppv <- cv_pred_sum2 %>% ppv(target, .pred_class) # positive predictive value
+ precision <- precision(cv_pred_sum2, target, .pred_class) # precision 
+ recall <- recall(cv_pred_sum2, target, .pred_class) # recall
+ kap <- cv_pred_sum2 %>% kap(target, .pred_class) # kappa
+ fmean <- f_meas(cv_pred_sum2, target, .pred_class) # f means
+ mcc_val <- mcc(cv_pred_sum2, target, .pred_class)
+ j_index <- j_index(cv_pred_sum2, target, .pred_class)
+ 
+ j_index <- j_index(cv_pred_sum, target, .pred_class)
+ 
+ 
+final_metrics2 <- bind_rows (acc_bal,ppv, precision, recall, kap, fmean, mcc_val, cv_metrics_sum2) 
+
+final_metrics <- final_metrics %>%
+  mutate(.estimate = ifelse(is.na(.estimate), mean, .estimate)) %>%
+  dplyr::select(-c(mean, .config))
+
+
+
+
+
+
+
+
+
+
+```
+
+## CV model accuracy metrics
+
+```{r run final model metrics, include = TRUE, echo = FALSE}
+
+ acc_bal <- bal_accuracy(cv_pred_sum, target, .pred_class)
+ ppv <- cv_pred_sum %>% ppv(target, .pred_class) # positive predictive value
+ precision <- precision(cv_pred_sum, target, .pred_class) # precision 
+ recall <- recall(cv_pred_sum, target, .pred_class) # recall
+ kap <- cv_pred_sum %>% kap(target, .pred_class) # kappa
+ fmean <- f_meas(cv_pred_sum, target, .pred_class) # f means
+ mcc_val <- mcc(cv_pred_sum, target, .pred_class)
+ 
+final_metrics <- bind_rows (acc_bal,ppv, precision, recall, kap, fmean, mcc_val, cv_metrics_sum) 
+
+final_metrics <- final_metrics %>%
+  mutate(.estimate = ifelse(is.na(.estimate), mean, .estimate)) %>%
+  dplyr::select(-c(mean, .config))
+
+kable(final_metrics)
+
+# confidence interval based on average prediction confus
+
+conf_matrix <- cv_pred_sum %>% 
+   conf_mat(target, .pred_class) %>%
+   pluck(1) %>%
+   as_tibble() %>%
+   ggplot(aes(Prediction, Truth, alpha = n)) +
+   geom_tile(show.legend = FALSE) +
+   geom_text(aes(label = n), colour = "black", alpha = 1, size = 3) + 
+   theme(axis.text.x = element_text(angle = 90))
+    
+ conf_matrix
+
+```
+
+```{r check for model overfitting, include = FALSE, eval = FALSE}
+# currently not included but if used this would require resample to be run on t_train data first (not currently coded)
+assess_fit <- last_fit(pem_workflow, uni_split)
+test_metrics <- assess_fit %>% collect_metrics()
+
+```
+
+
+```{r fit final model with all data, echo = FALSE}
+##Apply tuned model to all the data for predictions
+
+pem_workflow <- workflow() %>%
+    add_recipe(uni_recipe) %>%
+    add_model(randf_spec)
+
+model_final <- fit(pem_workflow, data = trDat)
+
+final_fit <- pull_workflow_fit(model_final)# %>%pull(.predictions)
+
+oob  <- round(model_final$fit$fit$fit$prediction.error, 3)
+
+saveRDS(model_final , file = paste(paste0(".", outDir), "tidy_model.rds", sep = "/"))
+
+```
+
+### Variable importance plot
+
+The top 20 variables of importance are: 
+
+```{r variable importance, include = TRUE, echo = FALSE}
+# update model 
+randf_final <- rand_forest(mtry = 20, min_n = 2, trees = 1000) %>%
+  set_mode("classification") %>%
+   #or "permutations
+
+
+randf_spec %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(target ~ ., 
+      data = juice())
+pem_workflow <- workflow() %>%
+    add_recipe(uni_recipe) %>%
+    add_model(randf_spec)
+
+
+# calculate the final variable importance per model 
+final_vip <- workflow() %>%
+  add_recipe(uni_recipe) %>%
+  add_model(randf_final) %>%
+  fit(trDat) %>%
+  pull_workflow_fit() %>%
+  vip(num_feature = 20) 
+
+final_vip
+
+
+randf_final 
+
+
+
+```
+  
+
+# Internal map accuracy testing. 
+
+In addition to internal machine learning metrics we assessed the predicted map accuracy using a bootstrap method by sites (transect pair). This process withholds one site and uses the remaining data to build a model and predict the map surface. The predicted map can then be compared to raw data for the with-held transect (at the resolution of the model) with-held site data (750m x 2 transects) to determine the map accuracy. This process is repeated for the total number of sites to provide a measure of the range in success at the map level.
+
+Map accuracy by map unit is a measure of how accurate the prediction is on a mapunit. Note currently success is only limited to field data relating to the modeled sub units. i.e. Non-forest field calls are grouped as "other" and not included in success rate for aspatial and spatial comparisons. The size of the points indicates the proportion of points on the transect (ie how much was observed on the landscape).
+
+```{r spatial map accuracy test, echo = FALSE, eval = TRUE}
+
+# read in the all points transect data for the correct resolution and edit names
+# this will be compared with the predicted surface. 
+
+field_transect <- field_transect %>%
+      dplyr::rename(target = mapunit1, 
+                    target2 = mapunit2) 
+
+# get unique names and number of unique sites for the training data     
+trID <- unique(trDat_all$tid) %>% as.character()
+trID <- trID[!is.na(trID)]
+
+ntrID <- length(trID)
+
+# subset data by removing columns not used for modelling
+
+trAll <- trDat_all %>%
+   dplyr::select(-c(target2, bgc_cat))
+
+
+##TO FIX =- change mapunit to target ?????
+
+#trans_units <- unique(field_transect$target)
+   
+# iterate through each of the sites 
+bsRes <- foreach(it = trID, .combine = rbind) %do% {
+
+      #it = trID[9] # testing line 
+      #print (paste0("currently processing ", it))
+      testID = it
+       
+      # get training dataset by removing held-out transect
+      trainDat <- trAll %>% filter(tid != testID)
+      trainDat <- data.table(trainDat)
+      trainDat[,`:=`(tid = NULL)]
+      numTr <- trainDat[,.(Num = .N), by = .(target)]
+    
+      trainClean <- foreach(unit = numTr$target, .combine = rbind) %do% {
+        dat <- trainDat[target == unit,]
+        dat
+      }
+      
+      trainClean <- unique(trainClean)
+      trainClean[,target := as.factor(as.character(target))]
+      
+      ##create model using cleaned transect data
+      set.seed(1234)
+      
+      bs_model <- fit(pem_workflow, data = trainClean)
+      
+      mod <- pull_workflow_fit(bs_model)$fit
+        
+      # subset the entire point data set based on transect ID for site of interest
+      testDat <- field_transect %>% dplyr::filter(tid == as.factor(as.character(testID)))
+      
+     #testDat <- field_transect %>% dplyr::filter(tid %in% "essfmcw")
+      
+      # create a subset with calls and XY values to add after predict
+      testDat_id <- testDat %>% 
+        dplyr::select(target, target2) %>%
+        cbind(st_coordinates(.)) %>%
+        st_drop_geometry(.)
+      
+      # create small table with columns for model only 
+      testDat <- testDat %>%
+        dplyr::select(any_of(names(trainClean))) %>%
+        dplyr::select(-target) %>%
+        st_drop_geometry()
+
+      # predict onto full transect of hold-out and convert from probability matrix        to single response 
+      Pred_prop <- predict(mod, testDat)$predictions
+      Pred <- colnames(Pred_prop)[apply(Pred_prop, 1, which.max)]
+      
+      # combine prediction and XY values to all points data set
+      testDat <- cbind(testDat_id , Pred)
+      testDat <- testDat %>%
+        mutate(target = ifelse(target == " ", NA, target))
+
+      length(testDat$target)
+      
+# Important point!
+# remove any values where non_forest in found on the ground (primary or secondary)
+      
+      testDat <- testDat %>%
+        #rowwise() %>%
+        #mutate(nf_to_drop = ifelse(str_detect(target, "_")|str_detect(target2,"_"), 1,0))
+      mutate(nf_to_drop = ifelse(str_detect(target, "_"), 1,0))
+        
+#     xxx <- testDat %>% 
+#        dplyr::select(target, target2, Pred,nf_to_drop) %>%
+#         distinct()
+#      xxx
+
+      testDat <- testDat %>% 
+        filter(nf_to_drop == 1) %>%
+        dplyr::select(-nf_to_drop)
+      
+      length(testDat$target)
+      
+      # calculate metrics 
+    
+      # 1) aspatial metrics 
+      aspatial <- testDat %>%
+        dplyr::select(target) %>%
+        group_by(target) %>%
+        mutate(trans.total = n()) %>%
+        distinct()
+      
+      #filter out non_forest 
+     #aspatial<- aspatial %>%
+    #    dplyr::filter(str_detect(target, "_", negate = FALSE))
+      
+      aspatial_map <- testDat   %>% 
+        dplyr::select(Pred)%>%
+        group_by(Pred) %>%
+        mutate(map.total = n(),
+               target = Pred) %>%
+        ungroup()%>%
+        dplyr::select(-Pred)%>%
+        distinct()
+      
+      aspatial <- full_join(aspatial, aspatial_map, by = "target") %>%
+        mutate(It = it, 
+               across(where(is.numeric), ~ replace_na(.,0)))
+    
+      # generate spatially explicit results for primary and prime/alternate
+      xx <- testDat %>%
+         tabyl(target, Pred)
+      
+      xy <- pivot_longer(xx, cols = !target) 
+  
+      spat_p <- xy %>%
+        filter(target == name) %>%
+        mutate(spat_p = value ) %>%
+        dplyr::select(target, spat_p)
+    
+      # extract spatial secondary call match 
+      spat_pa <- testDat %>%
+        filter(!is.na(target2)) %>%
+        filter(target != Pred)
+
+       if(nrow(spat_pa) == 0){
+         
+         spat_pa <- spat_p %>%
+           mutate(spat_pa = 0 ) %>%
+           dplyr::select(-spat_p)
+      #  aspatial <- left_join(aspatial, spat_p, by = "target") 
+          } else {
+         
+      spat_pa <- spat_pa %>%
+        tabyl(target2, Pred) %>%
+        pivot_longer(cols = !target2) %>%
+        filter(target2 == name) %>%
+        mutate(target = target2, 
+               spat_pa = value) %>%
+        dplyr::select(target, spat_pa)
+          }
+      
+       aspatial <- left_join(aspatial, spat_p, by = "target") %>%
+         left_join(spat_pa, by = "target")
+    
+       # generate the primary fuzzy calls: 
+       spat_fp_df <- xy %>%
+         left_join(fMat, by = c("target" = "target", "name" = "Pred")) %>%
+         rowwise() %>%
+         mutate(spat_fpt = fVal * value) %>%
+         group_by(target) %>%
+         mutate(spat_fp = sum(spat_fpt)) %>%
+         dplyr::select(target, spat_fp) %>%
+         distinct()
+    
+       aspatial <- left_join(aspatial,  spat_fp_df , by = "target") 
+
+       # generate fuzzy secondary calls : 
+      spat_fpa_df <- testDat %>%
+        dplyr::select(-X,-Y) %>%
+        left_join(fMat, by = c("target" = "target", "Pred" = "Pred")) %>%
+        left_join(fMat, by = c("target2" = "target", "Pred" = "Pred")) %>%
+        mutate(across(where(is.numeric), ~ replace_na(.,0))) %>%
+        rowwise() %>%
+        mutate(targetMax = ifelse(fVal.x >= fVal.y , target, target2)) %>%
+        dplyr::select(targetMax, Pred) %>%
+        tabyl(targetMax, Pred) %>%
+        pivot_longer(cols = !targetMax) %>%
+        left_join(fMat, by = c("targetMax" = "target", "name" = "Pred")) %>%
+         rowwise() %>%
+         mutate(spat_fpat = fVal * value) %>%
+         group_by(targetMax) %>%
+         mutate(spat_fpa = sum(spat_fpat)) %>%
+         dplyr::select(target = targetMax, spat_fpa) %>%
+         distinct()
+      
+       aspatial <- left_join(aspatial,  spat_fpa_df , by = "target") %>%
+         mutate(spat_pa = sum(spat_pa, spat_p, na.rm = TRUE))
+      
+       
+      # calculate accuracy and J statistic
+      testDat$target <- factor(testDat$target, levels = unique(c(levels(testDat$target), testDat$Pred)))
+      testDat$Pred <- factor(testDat$Pred, levels = levels(testDat$target))
+    
+      sen <- sens(testDat, target, Pred)
+      spec <- spec(testDat, target, Pred)
+      accuracy <- accuracy(testDat, target, Pred)
+      j_index <- j_index(testDat, target, Pred) 
+      mcc_val <- mcc(testDat, target, Pred)
+      bal_accuracy <- bal_accuracy(testDat, target, Pred)
+      f_means <- f_meas(testDat, target, Pred)
+      precision <- precision(testDat, target, Pred) # precision 
+      recall <- recall(testDat, target, Pred) # recall
+      kap <- kap(testDat, target, Pred) # kappa
+      
+      dout <- rbind(sen, spec, accuracy, j_index, mcc_val, bal_accuracy, f_means, 
+                    precision, recall, kap) %>%
+        dplyr::select(-.estimator) %>%
+        pivot_wider(names_from = .metric, values_from = .estimate)
+        
+      aspatial = cbind(aspatial, dout) 
+       
+} 
+
+## Error check
+#sum(bsRes$trans.total, na.rm = TRUE)
+#sum(bsRes$map.total, na.rm = TRUE)
+
+# format bsRes
+bsRes <- bsRes %>%
+    ungroup() %>%
+    mutate(across(where(is.numeric), ~ replace_na(.,0)))
+
+
+```
+
+    
+```{r, eval = FALSE, include = FALSE}
+# testing using slices rather than individual sites 
+
+
+# get unique slice names and number for iteration 
+slID <-  unique(gsub("\\..*", "", unique(trDat_all$tid)))
+slID <- slID[!is.na(slID)]
+nslID <- length(slID)
+
+
+# iterate through each of the sites 
+bsRes <- foreach(it = slID , .combine = rbind) %do% {
+
+      it = slID[1] # testing line 
+      #print (paste0("currently processing ", it))
+      testID = it
+       
+      # get training dataset by removing held-out transect
+      trainDat <- trAll %>% filter(tid != testID)
+      
+      # changed this line 
+      trainDat <- trAll %>%
+       dplyr::filter(str_detect(tid, testID, negate = TRUE )) %>%
+       droplevels()
+      
+      
+      
+      
+      
+      trainDat <- data.table(trainDat)
+      trainDat[,`:=`(tid = NULL)]
+      numTr <- trainDat[,.(Num = .N), by = .(target)]
+    
+      trainClean <- foreach(unit = numTr$target, .combine = rbind) %do% {
+        dat <- trainDat[target == unit,]
+        dat
+      }
+      
+      trainClean <- unique(trainClean)
+      trainClean[,target := as.factor(as.character(target))]
+      
+      ##create model using cleaned transect data
+      set.seed(1234)
+      bs_model <- fit(model_final, data = trainClean)
+      
+      mod <- pull_workflow_fit(bs_model)$fit
+        
+      # subset the entire point data set based on transect ID for site of interest
+      testDat <- field_transect %>% dplyr::filter(tid == as.factor(as.character(testID)))
+      
+     #testDat <- field_transect %>% dplyr::filter(tid %in% "essfmcw")
+      
+      # create a subset with calls and XY values to add after predict
+      testDat_id <- testDat %>% 
+        dplyr::select(target, target2) %>%
+        cbind(st_coordinates(.)) %>%
+        st_drop_geometry(.)
+      
+      # create small table with columns for model only 
+      testDat <- testDat %>%
+        dplyr::select(any_of(names(trainClean))) %>%
+        dplyr::select(-target) %>%
+        st_drop_geometry()
+
+      # predict onto full transect of hold-out and convert from probability matrix        to single response 
+      Pred_prop <- predict(mod, testDat)$predictions
+      Pred <- colnames(Pred_prop)[apply(Pred_prop, 1, which.max)]
+      
+      # combine prediction and XY values to all points data set
+      testDat <- cbind(testDat_id , Pred)
+      testDat <- testDat %>%
+        mutate(target = ifelse(target == " ", NA, target))
+
+      length(testDat$target)
+      
+# Important point!
+# remove any values where non_forest in found on the ground (primary or secondary)
+      
+      testDat <- testDat %>%
+        #rowwise() %>%
+        #mutate(nf_to_drop = ifelse(str_detect(target, "_")|str_detect(target2,"_"), 1,0))
+      mutate(nf_to_drop = ifelse(str_detect(target, "_"), 1,0))
+        
+#     xxx <- testDat %>% 
+#        dplyr::select(target, target2, Pred,nf_to_drop) %>%
+#         distinct()
+#      xxx
+
+      testDat <- testDat %>% 
+        filter(nf_to_drop == 1) %>%
+        dplyr::select(-nf_to_drop)
+      
+      length(testDat$target)
+      
+      # calculate metrics 
+    
+      # 1) aspatial metrics 
+      aspatial <- testDat %>%
+        dplyr::select(target) %>%
+        group_by(target) %>%
+        mutate(trans.total = n()) %>%
+        distinct()
+      
+      #filter out non_forest 
+     aspatial<- aspatial %>%
+        dplyr::filter(str_detect(target, "_", negate = FALSE))
+      
+      aspatial_map <- testDat   %>% 
+        dplyr::select(Pred)%>%
+        group_by(Pred) %>%
+        mutate(map.total = n(),
+               target = Pred) %>%
+        ungroup()%>%
+        dplyr::select(-Pred)%>%
+        distinct()
+      
+      aspatial <- full_join(aspatial, aspatial_map, by = "target") %>%
+        mutate(It = it, 
+               across(where(is.numeric), ~ replace_na(.,0)))
+    
+      # generate spatially explicit results for primary and prime/alternate
+      xx <- testDat %>%
+         tabyl(target, Pred)
+      
+      xy <- pivot_longer(xx, cols = !target) 
+  
+      spat_p <- xy %>%
+        filter(target == name) %>%
+        mutate(spat_p = value ) %>%
+        dplyr::select(target, spat_p)
+    
+      # extract spatial secondary call match 
+      spat_pa <- testDat %>%
+        filter(!is.na(target2)) %>%
+        filter(target != Pred)
+
+       if(nrow(spat_pa) == 0){
+         
+         spat_pa <- spat_p %>%
+           mutate(spat_pa = 0 ) %>%
+           dplyr::select(-spat_p)
+      #  aspatial <- left_join(aspatial, spat_p, by = "target") 
+          } else {
+         
+      spat_pa <- spat_pa %>%
+        tabyl(target2, Pred) %>%
+        pivot_longer(cols = !target2) %>%
+        filter(target2 == name) %>%
+        mutate(target = target2, 
+               spat_pa = value) %>%
+        dplyr::select(target, spat_pa)
+          }
+      
+       aspatial <- left_join(aspatial, spat_p, by = "target") %>%
+         left_join(spat_pa, by = "target")
+    
+       # generate the primary fuzzy calls: 
+       spat_fp_df <- xy %>%
+         left_join(fMat, by = c("target" = "target", "name" = "Pred")) %>%
+         rowwise() %>%
+         mutate(spat_fpt = fVal * value) %>%
+         group_by(target) %>%
+         mutate(spat_fp = sum(spat_fpt)) %>%
+         dplyr::select(target, spat_fp) %>%
+         distinct()
+    
+       aspatial <- left_join(aspatial,  spat_fp_df , by = "target") 
+
+       # generate fuzzy secondary calls : 
+      spat_fpa_df <- testDat %>%
+        dplyr::select(-X,-Y) %>%
+        left_join(fMat, by = c("target" = "target", "Pred" = "Pred")) %>%
+        left_join(fMat, by = c("target2" = "target", "Pred" = "Pred")) %>%
+        mutate(across(where(is.numeric), ~ replace_na(.,0))) %>%
+        rowwise() %>%
+        mutate(targetMax = ifelse(fVal.x >= fVal.y , target, target2)) %>%
+        dplyr::select(targetMax, Pred) %>%
+        tabyl(targetMax, Pred) %>%
+        pivot_longer(cols = !targetMax) %>%
+        left_join(fMat, by = c("targetMax" = "target", "name" = "Pred")) %>%
+         rowwise() %>%
+         mutate(spat_fpat = fVal * value) %>%
+         group_by(targetMax) %>%
+         mutate(spat_fpa = sum(spat_fpat)) %>%
+         dplyr::select(target = targetMax, spat_fpa) %>%
+         distinct()
+      
+       aspatial <- left_join(aspatial,  spat_fpa_df , by = "target") %>%
+         mutate(spat_pa = sum(spat_pa, spat_p, na.rm = TRUE))
+      
+       
+      # calculate accuracy and J statistic
+      testDat$target <- factor(testDat$target, levels = unique(c(levels(testDat$target), testDat$Pred)))
+      testDat$Pred <- factor(testDat$Pred, levels = levels(testDat$target))
+    
+      sen <- sens(testDat, target, Pred)
+      spec <- spec(testDat, target, Pred)
+      accuracy <- accuracy(testDat, target, Pred)
+      j_index <- j_index(testDat, target, Pred) 
+      mcc_val <- mcc(testDat, target, Pred)
+      bal_accuracy <- bal_accuracy(testDat, target, Pred)
+      f_means <- f_meas(testDat, target, Pred)
+      precision <- precision(testDat, target, Pred) # precision 
+      recall <- recall(testDat, target, Pred) # recall
+      kap <- kap(testDat, target, Pred) # kappa
+      
+      dout <- rbind(sen, spec, accuracy, j_index, mcc_val, bal_accuracy, f_means, 
+                    precision, recall, kap) %>%
+        dplyr::select(-.estimator) %>%
+        pivot_wider(names_from = .metric, values_from = .estimate)
+        
+      aspatial = cbind(aspatial, dout) 
+       
+} 
+
+## Error check
+#sum(bsRes$trans.total, na.rm = TRUE)
+#sum(bsRes$map.total, na.rm = TRUE)
+
+# format bsRes
+bsRes <- bsRes %>%
+    ungroup() %>%
+    mutate(across(where(is.numeric), ~ replace_na(.,0)))
+
+
+```
+    
+    
+    
+## Overall accuracy. 
+
+The overall map accuracy was calculated but determining the percent correct for each map unit by comparing transect data (held-out from the model) with the predicted map surface. This process was conducted for each site (pair of transects) to produce uncertainty metrics. Note this is suceptible to outliers and unbalanced transects. Note: as each model was limited to forest or specific bgc 
+
+### Types of accuracy 
+Several types of accuracy measures were calculated;
+
+1) aspatial: this is equivalent to traditional AA where proportion of map units are compared
+
+2) spatial (spat_p): this compares spatial equivalents for the primary call for each pixal/point predicted.
+
+3) spatial primary/alt calls (spat_pa). This assigns a value if the alternate call matches the predicted call. 
+
+4) fuzzy spatially explicit accuracy: we tested an alternate accuracy measure (spat_fp) to account for calls which were similar (on the edatopic position) to the correct calls. In this case scores could be awarded for on a sliding scale from 1 (Correct) to 0 (no where close) with partial credit assigned to closely related mapunits. Note this requires a matrix which specifies the similarity between all combinations of possible calls. This was also calculated for primary and alternate calls (spat_fpa)
+
+
+```{r, overall accuracy with confidence intervals, echo = FALSE, eval = TRUE}
+
+bsRes_all <- bsRes %>% 
+  group_by(It) %>%
+  mutate(trans_sum = sum(trans.total)) %>%
+  rowwise() %>%
+  mutate(aspat_p = min((trans.total/trans_sum),(map.total/trans.total))*100) %>%
+  group_by(It) %>%
+  mutate(aspat_p_tot = sum(aspat_p),
+         spat_p_tot = sum(spat_p/sum(trans.total))*100,
+         spat_pa_tot = sum(spat_pa/sum(trans.total))*100,
+         spat_fp_tot = sum(spat_fp/sum(trans.total))*100,
+         spat_fpa_tot = sum(spat_fpa/sum(trans.total))*100,
+         spat_p_sens = sens * 100,
+         spat_p_spec = spec * 100,
+         spat_p_accuracy = accuracy * 100,
+         spat_p_j_index = j_index * 100,
+         spat_p_bal_accuracy = bal_accuracy * 100,
+         spat_p_mcc = mcc *100,
+         spat_p_recall = recall * 100,
+         spat_p_f_meas = f_meas * 100,
+         spat_p_precision = precision * 100,
+         spat_p_kap = kap * 100 
+         ) %>%
+  dplyr::select(c(It, aspat_p_tot, spat_p_tot, spat_pa_tot,spat_fp_tot, spat_fpa_tot,spat_p_sens:spat_p_kap )) %>%
+   pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+  distinct()
+
+
+p2 <- ggplot(aes(y = value, x = accuracy_type), data = bsRes_all) + 
+   geom_boxplot() + 
+   geom_jitter(position=position_jitter(width=.1), colour = "grey", alpha = 0.8) + 
+   geom_hline(yintercept = 65,linetype ="dashed", color = "red") + 
+   ggtitle("Overall accuracy (median + quartiles)") + 
+   theme(axis.text.x = element_text(angle = 90)) +
+   xlab("Mapunit") + ylab("Accuracy") + 
+   ylim(-0.05, 100) 
+
+p2
+
+```
+
+## Accuracy per mapunit
+
+We can compare map unit accuracy levels to assess under or acceptable performance per map units. 
+
+```{r generate overall mapunit, echo = FALSE, eval = TRUE}
+
+# need to drop the accuracy measures as these are base on entire confusion matrix not mapunit
+
+mapunit_tot <- bsRes %>% 
+  group_by(target) %>%
+  summarise(across(.cols = where(is.numeric), ~ sum(.x, na.rm = TRUE))) %>%
+  ungroup() %>%
+  dplyr::select(-c(sens:kap))
+  
+mapunit_pc <- mapunit_tot %>%
+  rowwise() %>%
+  summarise(across(.cols = starts_with("spat"), ~ (.x)/trans.total*100)) %>%
+  bind_cols(target = mapunit_tot$target) %>%
+  pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+  filter(target %in%  target[str_detect(target, "_")]) 
+
+# for primary outputs only
+mapunit_pc_p <- mapunit_pc %>%
+  filter(accuracy_type == "spat_p")
+
+p2 <- ggplot(aes(y = value, x = target), data = mapunit_pc_p) + 
+   geom_bar(stat = "identity") + 
+   geom_hline(yintercept = 65,linetype ="dashed", color = "red") + 
+   ggtitle("Unweighted spatial (primary) accuracy per mapunit") + 
+   theme(axis.text.x = element_text(angle = 90)) +
+   xlab("Mapunit") + ylab("Accuracy") + 
+   ylim(-0.05, 100)
+
+p2
+
+
+# export out the raw values to compare between models ; add weighted value 
+# all output values
+# 
+# p3 <- ggplot(aes(y = value, x = target, fill = accuracy_type ), data = mapunit_pc) + 
+#    geom_bar(stat = "identity", position=position_dodge()) + 
+#    geom_hline(yintercept = 65,linetype ="dashed", color = "red") + 
+#    ggtitle("Unweighted accuracy per mapunit (per site)") + 
+#    theme(axis.text.x = element_text(angle = 90)) +
+#    xlab("Mapunit") + ylab("Accuracy") + 
+#    ylim(-0.05, 100) + 
+#    scale_fill_brewer(palette="RdYlGn") 
+# 
+# p3
+
+```
+
+
+```{r map unit accuracy, echo = FALSE, fig.height = 5, fig.width = 10, eval = TRUE}
+# option 2: calculate overall accuracy based on iterations 
+
+bsRes_site <- bsRes %>% 
+  #filter(It == "SBSmc2_5.2_22") %>%
+  rowwise() %>%
+  mutate(spat_p_pc = spat_p/trans.total * 100, 
+         spat_pa_pc = spat_pa/trans.total * 100,
+         spat_fp_pc = spat_fp/trans.total * 100, 
+         spat_fpa_pc = spat_fpa/trans.total * 100,
+         aspat_p_pc = min(trans.total, map.total)/trans.total * 100)
+ 
+bsRes_site_totals <- bsRes_site %>%
+  dplyr::select(c(target, It, trans.total)) 
+
+bsRes_site <-  bsRes_site %>%
+ pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+#  filter(accuracy_type %in% c("spat_p_pc", "spat_pa_pc", "spat_fp_pc", "spat_fpa_pc", "aspat_p_pc"))  %>%
+  filter(accuracy_type %in% c("spat_p_pc", "aspat_p_pc")) %>%
+  filter(target %in%  target[str_detect(target, "_")]) %>%
+  left_join(bsRes_site_totals)
+       
+  
+p3 <- ggplot(aes(y = value, x = target ), data = bsRes_site) + 
+   geom_boxplot() + #stat = "identity") + 
+   facet_wrap(~accuracy_type) + 
+   geom_jitter(aes(size = trans.total), position=position_jitter(width=.2), colour = "grey", alpha = 0.5) + 
+   geom_hline(yintercept = 65,linetype ="dashed", color = "red") + 
+   ggtitle("Unweighted accuracy per mapunit (per site)") + 
+   theme(axis.text.x = element_text(angle = 90)) +
+   xlab("Mapunit") + ylab("Accuracy") + 
+   ylim(-0.05, 100) 
+
+
+p3
+```
+**note**: size of points represent the number of points 
+
+```{r map unit accuracy 2, echo = FALSE, fig.height = 10, fig.width = 15}
+# 
+# p4 <- ggplot(aes(y = value, x = target ), data = bsRes_site) + 
+#    geom_boxplot() + #stat = "identity") + 
+#    facet_wrap(~accuracy_type) + 
+#    geom_jitter(position=position_jitter(width=.2), colour = "grey", alpha = 0.5) + 
+#    geom_hline(yintercept = 65,linetype ="dashed", color = "red") + 
+#    ggtitle("Unweighted accuracy per mapunit (per site)") + 
+#    theme(axis.text.x = element_text(angle = 90)) +
+#    xlab("Mapunit") + ylab("Accuracy") + 
+#    ylim(-0.05, 100) 
+# 
+# 
+# p4
+
+```
+
+```{r save ML internal metrics, echo = FALSE, include = TRUE}
+# output training pt summary (brake down ratio of training points), name of training points
+
+trDat_sum <- trDat_sum %>%
+  dplyr::mutate(total_pts = sum(freq), 
+                samp_var = var(prop),
+                bgc = ifelse(str_detect(mname, "_bgc"), gsub("_[[:digit:]].*","", target), "all"),
+                training_pt_type = basename(indata)) %>%
+  dplyr::mutate(training_pt_type = gsub("_pts_att.gpkg", "", training_pt_type))
+
+ml_results = final_metrics %>%
+  dplyr::select(c(.metric, .estimate)) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) 
+   
+trDat_sum <- trDat_sum %>%
+  cbind(ml_results) 
+
+save(trDat_sum, file =  paste(paste0('.', outDir), "model_summary.RData", sep = "/"))
+save(final_metrics, file =  paste(paste0('.', outDir), "ml_internal_metrics.RData", sep = "/"))
+
+```
+
+```{r save outputs for later comparisons, echo= FALSE, eval = TRUE}
+# add the metrics for mapping 
+bsRes_long <- bsRes %>%
+  mutate(training_pt_type = basename(indata),
+         model_name = mrep) %>%
+  dplyr::mutate(training_pt_type = gsub("_pts_att.gpkg", "", training_pt_type))
+
+bsRes_all <- bsRes_all %>%
+   mutate(training_pt_type = basename(indata),
+         model_name = mrep) %>%
+  dplyr::mutate(training_pt_type = gsub("_pts_att.gpkg", "", training_pt_type))
+
+
+save(bsRes_long, file =  paste(paste0('.', outDir), "map_details.RData", sep = "/"))
+save(bsRes_all, file =  paste(paste0('.', outDir), "map_summary.RData", sep = "/"))
+
+
+```
+  
+  
+# References: 
+- https://towardsdatascience.com/modelling-with-tidymodels-and-parsnip-bae2c01c131c
+
+* [accuracy](https://yardstick.tidymodels.org/reference/accuracy.html) 
+* [roc_auc](https://yardstick.tidymodels.org/reference/roc_auc)
+* [sensitivity](https://yardstick.tidymodels.org/reference/sens.html) 
+* [specificity](https://yardstick.tidymodels.org/reference/spec.html)
+* [positive predictive value (ppv)](https://yardstick.tidymodels.org/reference/ppv.html)  
+  
+  

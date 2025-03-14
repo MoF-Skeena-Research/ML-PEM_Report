@@ -1,0 +1,627 @@
+---
+title: "Machine Learning Ensemble Model"
+subtitle: "Using ranger, glmnet, xgboost, and nnTrain"
+output: html_document
+params:
+  outDir: outDir
+  traindat: traindat
+  target: target
+  indata: indata
+  mmu: mmu
+  mname: mname
+  rseed: NA
+  
+  
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=FALSE,
+                      warning = FALSE, message = FALSE,
+                      results = 'show',
+                      eval = TRUE)  ## flag eval = false for quick text edits
+```
+
+```{r, echo=FALSE}
+# install.packages("mlr", dependencies = TRUE)
+library(mlr)
+library(tidyverse)
+
+## Load the data
+
+modDat <- inmdata 
+target <- "target"
+outDir = outDir
+mmu = mmu
+mname = mname
+rseed = 456
+
+
+#modDat <- params$traindat
+#target <- params$target
+#indata <- params$indata
+#mmu <- params$mmu
+#mname <- params$mname
+
+## define output directory
+#outDir <- params$outDir
+
+
+```
+
+# _Testing_
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+## Load the data
+
+#modDat <- modDat[,1:5] # get small test set
+
+## simplify testing data -- samples with low frequency need to be dropped -- mucks up validation
+summary(as.factor(modDat$target))
+
+## remove clases with less than five 
+#remove <- sort(unique(modDat$target)) %>% as.character()
+#remove <- remove[c(1:9)]
+
+#modDat <- modDat[modDat$target %notin% remove, ]
+modDat$target <- droplevels(modDat$target)
+
+#target = "target"
+table(modDat$target)
+
+## define output directory
+#outDir <- "D:/PEM_DATA/Temp_testing/mlr_ensb"
+#rseed <- NA
+```
+
+
+
+
+
+## Response variable: _`r target`_
+
+These are the response variable classes including the number in each class that we want to predict.
+```{r,echo=FALSE}
+table(modDat[, target])
+```
+
+
+## Begin modeling
+
+
+### Define the Task and Learner
+
+```{r, echo=FALSE}
+## use or create a random number seed -- this can be used to repeat results in future.
+if (!is.na(rseed)) {
+  set.seed(rseed)
+  print(paste("Random number generator seed set to:", rseed))
+  } else {
+  rseed <- as.integer(Sys.time())
+  print(paste("Random number generator seed set to:", rseed))
+}
+
+
+```
+
+```{r}
+## Create task
+tsk <- makeClassifTask(data = modDat, target = target)
+
+## Define Learner -- here we create an ensemble learner
+esbLrns <- c("classif.ranger", "classif.glmnet", "classif.xgboost", "classif.nnTrain")
+
+## Creates a list of learners using producing probability
+lrns <- list(mlr::makeLearner(esbLrns[1]),
+            mlr::makeLearner(esbLrns[2]),
+            mlr::makeLearner(esbLrns[3], verbose=1),
+            mlr::makeLearner(esbLrns[4]))
+lrns <- lapply(lrns, setPredictType, "prob") ## use prob as the type 
+
+
+## converts the list of learners to a ensemble 
+lrn <- mlr::makeStackedLearner(base.learners = lrns, predict.type = "prob", 
+                               method = "stack.cv", 
+                               super.learner = "classif.glmnet")
+```
+
+### Complete Validataion
+
+This is done by creating a _test_ and _training_ data sets from the data provided.  Twenty percent of the data is set asside for testing (1 in 5). _Note the current script selects the 20% in a regualar sequence ... this should be changed to a random draw_.
+
+```{r}
+### Not working with Ensemble model -- this section is skipped.
+## Defines the validation method 
+# resp <- makeResampleDesc("RepCV",     ## repeated cross fold
+#                          folds = 10,   ## k-folds 5 or 10 as default.  Ideally all folds should be equal size.
+#                          reps  = 3)   ## note this will mean 5 x 3 iterations through the data
+#    ## note: 5 fold 3 repeats is a little low.  I would prefer 10 x 10 but that takes additional time...
+# 
+# ## Execute cross validation
+# cv <- mlr::resample(learner = lrn,
+#                resampling = resp)
+# 
+# saveRDS(cv, file = paste(outDir, "cv_results.rds", sep = "/"))
+#      task = tsk,
+#           
+
+
+## specified validation -- test and training sets 
+## seperate the test and training datasets 
+test <- seq(5, nrow(modDat), by = 5) ## create a sequence to select every 5th row 
+
+test.dat  <- modDat[test,]
+train.dat <- modDat[-test,]
+
+## define task, train, and then predict
+## task defined 
+train.tsk  <- mlr::makeClassifTask(data = train.dat,  
+                                   target = target) 
+
+## train 
+parallelMap::parallelStartSocket(parallel::detectCores()-1)
+  train.mod  <- mlr::train(lrn, train.tsk)              
+parallelMap::parallelStop()
+
+## Predict 
+pred <- predict(train.mod, newdata = test.dat)
+
+pred$data$truth <- test.dat[,1]
+  
+
+### performance metrics 
+val <- mlr::performance(pred, measures = list(acc,logloss))
+```
+
+#### Resampling results
+
+- Model accuracy is  **`r round(val[1],4)`**.
+- log loss is **`r round(val[2],4)`**.
+
+
+#### Confusion Matrices
+
+_not currently available ... _
+
+<!-- ```{r} -->
+<!-- cf_matrix <- calculateConfusionMatrix(pred$pred, -->
+<!--                                       relative = TRUE, -->
+<!--                                       sums = TRUE) -->
+<!-- ``` -->
+
+<!-- ##### Absolute matrix -->
+
+<!-- <div style = "font-size:10pt"> -->
+
+<!-- ```{r cf-matix, echo = FALSE} -->
+<!-- knitr::kable(cf_matrix$result) -->
+<!-- ``` -->
+
+<!-- </div> -->
+
+
+<!-- ##### Relative Matrix -->
+
+<!-- <div style = "font-size:10pt"> -->
+
+<!-- ```{r cf-matix-rel, echo=FALSE} -->
+<!-- knitr::kable(round(cf_matrix$relative.row, 2)) -->
+<!-- ``` -->
+
+<!-- </div> -->
+
+
+### Train the model
+
+The model is trained using all the data and then saved.
+```{r}
+parallelMap::parallelStartSocket(parallel::detectCores()-1)
+mod <- train(lrn, tsk)
+parallelMap::parallelStop()
+#saveRDS(mod, paste(outDir, "model_ens.rds", sep = "/"))
+saveRDS(mod,"D:/PEM_DATA/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc_S2/SBSmc2/model_ens.rds")
+#saveRDS(mod,"model_ens.rds")
+
+```
+
+### Variable importance
+
+_not available for this type of model_
+
+```{r var-imp, echo=FALSE}
+# var_imp <- as.data.frame(mod$learner.model$variable.importance) %>%
+#     rownames_to_column()
+#   names(var_imp) <- c("name", "VaribleImportance")
+# 
+# knitr::kable(var_imp %>% arrange(desc(VaribleImportance)) %>% head(., 20))
+```
+
+
+## Complete
+
+Congratulations your model has been generated.
+
+Files are saved:
+
+```{r, echo = FALSE}
+# outDir <- "e:/tmp/model_gen_test/" ## Testing
+fn <- as.data.frame(list.files(outDir, full.names = TRUE))
+names(fn) <- "Files"
+knitr::kable(fn)
+```
+
+
+```{r}
+
+ grid25m = raster::stack(paste0("D:/Hengle_Boundary_PEM/stacked25m_dec/",  mod$features, ".tif"))
+ grid25m = as(grid25m, "SpatialGridDataFrame")
+ grid25m = as(grid25m, "SpatialPixelsDataFrame")
+ names(grid25m) = mod$features
+ 
+ # make a small subset for testing
+ grid25m <- grid25m[1:1000,]
+ 
+  sel.p = complete.cases(grid25m@data)
+  summary(sel.p)
+
+#  pr.grid25m = predict_eml(m.mapunit1, grid25m[sel.p,])
+ 
+# break down the fn    
+#predict_eml <- function(object, predictionLocations)
+  
+  object = mod
+  predictionLocations = grid25m[sel.p,]
+  
+  
+  
+  
+  
+  out <- predict(object, newdata=predictionLocations@data)
+ 
+   if(any(class(object)=="BaseEnsembleModel")){
+    message("Predicting values using 'getStackedBaseLearnerPredictions'...", immediate. = TRUE)
+    out.c <- as.matrix(as.data.frame(mlr::getStackedBaseLearnerPredictions(object, newdata=predictionLocations@data)))
+    if(any(object$task.desc$type=="classif")){
+      lvs <- object$task.desc$class.levels
+      ## estimate weights:
+      pred.prob <- NULL
+      wt = rep(1, length(lvs))
+      for(j in lvs){
+        pred.prob[[paste0("error.",j)]] <- matrixStats::rowSds(out.c[,grep(paste0(".", j), attr(out.c, "dimnames")[[2]])], na.rm = TRUE)
+      }
+    }
+    pred <- SpatialPixelsDataFrame(predictionLocations@coords, data=cbind(out$data, data.frame(pred.prob)), grid = predictionLocations@grid, proj4string = predictionLocations@proj4string)
+  }
+  return(out <- list(pred=pred, subpred=as.data.frame(out.c)))
+}
+
+   library(rgdal)
+     ## export to GeoTIFFs:
+  grid25m[sel.p,"response"] = as.integer(out$pred@data[,"response"])
+  writeGDAL(grid25m["response"], paste0("D:/Hengle_Boundary_PEM/predicted25m_dev/mapunit1_classes_25m.tif"), options = c("COMPRESS=DEFLATE"))
+  
+  x = parallel::mclapply(names(out$pred), function(i){  writeGDAL(out$pred[i], paste0("D:/Hengle_Boundary_PEM/predicted25m_dev/", i,"_25m.tif"), options = c("COMPRESS=DEFLATE")) }, mc.cores = 1)
+  
+  x = parallel::mclapply(names(pr.grid25m$subpred), function(i){ grid25m[sel.p,i] <- pr.grid25m$subpred[i];  writeGDAL(grid25m[i], paste0("./subpred25m/", i,"_25m.tif"), options = c("COMPRESS=DEFLATE")) }, mc.cores = 30)
+}
+   
+   
+ predict_map(model = paste0(outDir, "/model.rds"), 
+                  cov = rast_list[1:4], 
+                  tilesize = 500,
+                  outDir = outDir)
+
+```
+
+Generate a map using tiles. 
+
+```{r}
+
+  # testing
+  #
+   model = "D:/PEM_DATA/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc_S2/SBSmc2/model_ens.rds"
+  mod <- readRDS(model)
+
+   cov = paste0("D:/Hengle_Boundary_PEM/stacked5m_dec/",  mod$features, ".tif")
+
+   tilesize = 500
+   outDir = "D:/PEM_DATA/BEC_DevExchange_Work/Deception_AOI/3_maps_analysis/models/forest/fore_mu_bgc_S2/SBSmc2/predicted"
+ 
+
+  ## libraries  -----
+  library(dplyr)
+  library(mlr)
+   library(raster)
+   #library(sf)
+  
+  # Adjust names
+  ## This will be used in the loop to rename stars object
+  n <- basename(cov)
+  n <- gsub(".tif", "", n)
+  
+  ## Load the model -----
+  #mod <- readRDS(model)
+  
+  ## Error handle -- model vs. cov -----------
+  ## If names in model features are found in the cov list continue.
+  ## ELSE exit with message
+  if (length(setdiff(mod$features, n)) != 0) { ## tests if all model features are found in the cov list
+    ## On model vs. cov error ---------------
+    print("Name mis-match between the model features and the names of the rasters.")
+    print("The following raster co-variates are not found in the model features list:")
+    print(setdiff(mod$features, n))
+  } else {
+    
+    ## drop rasters if not included in model
+    if (length(setdiff(n, mod$features) > 0 )) {
+      print("The following rasters are removed as they were not included in the model:")
+      print(setdiff(n, mod$features))
+      
+      ## drop layers not used
+      drop_layers <- paste0(setdiff(n, mod$features), ".tif")
+      cov <- subset(cov, !(basename(cov) %in% drop_layers) )
+      n <- basename(cov) ; n <- gsub(".tif", "", n)  ## fix n
+    }
+    
+    
+    ## create output dir -----------
+    ifelse(!dir.exists(outDir), dir.create(outDir, recursive = TRUE), 
+           print("model folder already exists"))
+    
+    
+    source(here::here('_functions', 'tile_index.R'))
+    
+    tiles <- tile_index(cov[1], tilesize)
+    
+    
+    ## begin loop through tiles -----
+    
+    for (i in 8:nrow(tiles)) {    ## testing first 2 tiles       ##nrow(tiles)) {
+      #i = 7
+      t <- tiles[i,]  ## get tile
+      print(paste("working on ", i, "of", nrow(tiles)))
+      print("...")
+      
+      
+      ## * load tile area---------
+      print("... loading new data (from rasters)...")
+      
+      # extract raster for the area of the tile
+      
+      t <- as(t, 'Spatial')
+      
+      r <- raster::crop(stack(cov), raster::extent(t))
+      #r <- mask(r, as(bgc_filter,'Spatial'))
+      
+      
+      # create a raster template in stars to convert back to stars object 
+      rtemplate <- stars::st_as_stars(r[[1]])
+      
+      ### chcek this!!!!
+      
+      # grab point values for the raster stack
+      rsf <- rasterToPoints(r)
+      
+      rsf.xy <- rsf[,c(1,2)] # keep xy to convert back to raster below
+      rsf.sf <- st_as_sf(as.data.frame(rsf.xy), coords = c("x","y"), crs = 3005)
+      rsf <- rsf[,-c(1:2)] # drop xy values
+      colnames(rsf) = tolower(colnames(rsf))
+      rsf.df <- as.data.frame(rsf) 
+      rsf.df
+      
+      ## * Test if tile is empty  -------
+      if(any(sapply(rsf.df, function(x) all(is.na(x))) == TRUE)){
+        
+        print("some variables with all NA values, skipping tile")
+        
+      } else {
+        
+        ## * Test if tile is empty -------------
+        #  na_table <- as.data.frame(sapply(rsf, function(x) sum(is.na(x))))
+        ## * determine na counts -- this will be used to restore NA values if tile is run.
+        #  na_table$count <- as.data.frame(sapply(rsf, function(x) sum(is.na(x))))[,1]
+        
+        ## * Identify the attribute with the highest number of NA values.
+        #  na_max <- na_table[na_table$count ==  max(na_table$count),]
+        #  na_max <- row.names(na_max[1,]) ## if multiple attributes -- take the first
+        ## make a copy of the attribute with the highest number of na values
+        #  rsf_bk <- rsf[,na_max]  ## -- this will be used to restore NA values
+        
+        #  nas <- map(rsf, ~sum(is.na(.)))
+        #  na_max <- nas[which.max(nas),]
+        #  rsf_bk  <- row.names(na_max[1,])
+        
+        
+        ## * predict ---------
+        ## When some of the values are NA change them to zero
+        rsf_bk <- rsf  ## create a backup of rsf -- this will be used to restore NA values
+        rsf.df[is.na(rsf.df)] <- 0 ## convert NA to zero as the predict function cannot handle NA
+        
+        print("... modelling outcomes (predicting)...")
+        pred <- predict(mod, newdata = rsf.df)
+        
+       # pp <- pred
+        
+        # extract the predictions from each of the models 
+      
+        out.c <- as.matrix(as.data.frame(mlr::getStackedBaseLearnerPredictions(mod, newdata=rsf.df)))
+        
+        #generate a summary layer
+          
+        # generate a layer with porportion of models that agreed.
+        library(data.table)
+        dat <- as.data.table(out.c)
+        dat[,ID := seq(nrow(dat ))]
+        dat <- data.table::melt(dat, id.vars = "ID")
+        setnames(dat, c("ID","Model","Response"))
+        dat2 <- dat[,.(Num = .N), by = .(ID, Response)]
+        dat2 <- dat2[,.(MaxNum = max(Num)), by = ID]
+        dat2[,PropSame := MaxNum/4]
+        #dat3 <- dat[,.(NumMods = length(unique(Response))), by = ID]
+        
+        library(dplyr)
+        # proportion of model agreement
+        out.proportion <- cbind(rsf.sf, data.frame(dat2)) %>%
+            dplyr::select(-c(ID, MaxNum))
+        
+        # generate a layer per model results 
+        # convert to numeric first 
+        
+        out.c.df <- as.data.frame(out.c) %>% mutate_if(is.character,as.factor)
+        out.c.df[,1] <- as.numeric(out.c.df[,1])
+        out.c.df[,2] <- as.numeric(out.c.df[,2])
+        out.c.df[,3] <- as.numeric(out.c.df[,3])
+        out.c.df[,4] <- as.numeric(out.c.df[,4])
+        
+    
+        out.c.df  <- cbind(rsf.sf, out.c.df)
+        
+        out_dat <- out.c.df 
+       # out_dat[is.na(rsf_bk[,1]), 1:length(out_dat)] <- NA 
+      
+        # Add some weighting 
+        #lvs <- mod$task.desc$class.levels
+        ## estimate weights:
+        #  pred.prob <- NULL
+        #  wt = rep(1, length(lvs))
+        #    for(j in lvs){
+        #      j <- lvs[1]
+        #pred.prob[[paste0("error.",j)]] <- matrixStats::rowSds(
+        #  out.c[,grep(paste0(".", j), attr(out.c, "dimnames")[[2]])], na.rm = TRUE)
+      #}
+  
+        ## Restore NA values
+        pred_dat <- pred$data ## predicted values extracted then changed
+        pred_dat[is.na(rsf_bk[,1]), 1:length(pred_dat)] <- NA ## if originally NA restore NA
+        pred$data <- pred_dat ## values restored to pred -- allows for cbind without issue.
+        
+        ## * geo-link predicted values ---------
+        
+        r_out <- cbind(rsf.sf, pred$data)
+        
+        ## layers to keep (i.e. newly predicted layers)
+        keep <- names(pred_dat)
+        #r_out <- r_out %>% dplyr::select(keep)
+        
+        ## Save the names of the model response -----
+        ## The levels are in the multiclass 'response'
+        wkey <- 0
+        if (wkey == 0)  {
+          respNames <- levels(r_out$response) ## this becomes the dictionary to describe the raster values
+          write.csv(respNames, paste(outDir, "response_names.csv",
+                                     sep = "/"),
+                    row.names = TRUE)
+          wkey <- 1 ## Change this value so this small is statement does not execute again.
+        }
+        
+        ## change the text values to numeric values.
+ #       r_out$response <- as.numeric(r_out$response)
+        
+        ## Set up subdirectories for rastertile outputs
+        # print("... exporting raster tiles...")
+        # for (k in keep) {
+        #   dir.create(paste(outDir, k, sep = "/"))
+        # }
+        # 
+        # 
+        # ## * save tile (each pred item saved) ---------
+         for (j in 1:length(keep)) {
+           j <- 1  ## testing
+           out <- stars::st_rasterize(r_out[j],
+                                      template = rtemplate)
+           st_crs(out) = "+proj=aea +lat_1=50 +lat_2=58.5 +lat_0=45 +lon_0=-126 +x_0=1000000 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+           
+           #out + template
+           stars::write_stars(out,
+                              paste0(outDir,"/",
+                                     keep[j], "/",             #sub-directoy
+                                     keep[j], "_", i, ".tif")) #tile name
+         }
+        
+        
+        # output the submodel components: 
+        
+        library(sf)
+        out.proportion<- stars::st_rasterize(out.proportion,
+                                     template = rtemplate)
+        
+        st_crs(out.proportion) = 3005
+          
+          #out + template
+          stars::write_stars( out.proportion,
+                             paste0(outDir,"/",
+                                    "submodel", "/", "proportion", "/",    #sub-directoy
+                                     "model_propagree_",i,".tif")) #tile name
+  
+        # write out subcomponents
+        keep_ens <- names(out_dat) 
+      
+        ## Set up subdirectories for rastertile outputs
+       # print("... exporting raster tiles...")
+      #  for (kk in keep_ens) {
+      #    dir.create(paste(outDir, kk, sep = "/"))
+      #  }
+       
+  
+        for (kkk in 1:length(keep_ens)) {
+          #kk <- 1  ## testing
+          out <- stars::st_rasterize(out_dat[kkk],
+                                     template = rtemplate)
+#          st_crs(out) = "+proj=aea +lat_1=50 +lat_2=58.5 +lat_0=45 +lon_0=-126 +x_0=1000000 #+y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+          st_crs(out) = 3005
+            
+          #out + template
+          stars::write_stars(out,
+                             paste0(outDir,"/",
+                                    keep_ens[kkk], "/",             #sub-directoy
+                                    keep_ens[kkk], "_", i, ".tif")) #tile name
+        }
+
+        
+        
+      } ## end if statement -- for when tile is empty
+      
+    } ## END of TILE LOOP -------------
+    
+    print("All predicted tiles generated")
+    
+    ## Mosaic Tiles ---------------
+    
+    print("Generating raster mosaics")
+    for (k in keep) {
+      # get list of tiles
+      k = "prob.SBSmc2_01" # testing
+      r_tiles <- list.files(paste(outDir, k, sep = "/"),
+                            pattern = ".tif$",
+                            full.names = TRUE)
+      
+      ## mosaic
+      gdalUtils::mosaic_rasters(gdalfile = r_tiles,
+                                dst_dataset = paste0(outDir, "/", k, ".tif"),  #output: dir and filename
+                                output_Raster = TRUE) ## saves the raster (not just a virtual raster)
+      
+    }
+    
+    for (kkk in keep) {
+      # get list of tiles
+      #k = "response" # testing
+      r_tiles <- list.files(paste(outDir, k, sep = "/"),
+                            pattern = ".tif$",
+                            full.names = TRUE)
+      
+      ## mosaic
+      gdalUtils::mosaic_rasters(gdalfile = r_tiles,
+                                dst_dataset = paste0(outDir, "/", k, ".tif"),  #output: dir and filename
+                                output_Raster = TRUE) ## saves the raster (not just a virtual raster)
+      
+    }
+
+    
+    
+  } ### end positive if statment ----------
+  
+} ### end function
+
+```
+

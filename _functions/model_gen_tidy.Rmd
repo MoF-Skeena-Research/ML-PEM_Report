@@ -1,0 +1,771 @@
+---
+title: "Machine Learning Model: tidyverse"
+output: html_document
+params:
+  outDir: "."
+  trDat: trDat
+  target: target
+  target2: target2
+  tid: tid
+  ds_ratio: ds_ratio
+  sm_ratio: sm_ratio
+  rseed: NA
+  infiles: infiles
+  mmu: mmu
+  mname: mname
+  field_transect: field_transect
+  
+  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=FALSE,
+                      warning = FALSE, message = FALSE,
+                      results = 'show',
+                      eval = TRUE)  ## flag eval = false for quick text edits
+```
+
+```{r, echo=FALSE}
+## Load the data and parameters as specified in the R script (model_gen_tidy.R)
+
+trDat <- params$trDat
+target <- params$target
+target2 <- params$target2
+tid <- params$tid
+ds_ratio <- params$ds_ratio
+sm_ratio <- params$sm_ratio
+infiles<- params$infiles
+mmu <- params$mmu
+mname <- params$mname
+field_transect <- params$field_transect
+outDir <- params$outDir
+
+
+library(data.table)
+library(knitr)
+#library(cowplot)
+library(tidymodels)
+library(tidyverse)
+library(themis)
+library(ggplot2)
+library(janitor)
+library(Hmisc)
+library(dplyr)
+
+
+# # Manual testing : option 
+# # 
+# trDat = mpts          # load all bgc model data
+#      trDat = inmdata_all   # load per bgc model data
+# # # # # # # #
+#       target = "target"       # primary call or target column name
+#       target2 = "target2"
+#       tid = "tid"             # transect_id column
+#       ds_ratio = NA #ds_ratio
+#        sm_ratio = NA #sm_ratio
+#      outDir = outDir         # output file
+#     indata = indata         # name of input data file for reporting
+#       rseed = 456             # define seed to remove random nature of model
+#        mmu = mmu               #
+#       mname = mname           # model name for reporting
+
+```
+
+
+This model uses the following parameters: 
+
+* **model reference:** `r params$mname` 
+* **mapunit:** `r mmu`
+* **training point set : **`r params$infiles`
+* **model response and covariates: ** `r names(trDat)`
+
+
+## Response variable: _`r target`_
+
+The following training points and frequency of points were used in the model. 
+
+```{r summary, echo = FALSE, include = TRUE}
+table(trDat[, target])
+
+# calculate summary of raw training data set
+trDat_sum <- trDat %>%
+  dplyr::group_by(target) %>%
+  dplyr::summarise(freq = n()) %>%
+  dplyr::mutate(prop = round(freq/sum(freq),3))
+
+ggplot(trDat, aes(target)) +
+  geom_bar() + 
+  theme(axis.text.x = element_text(angle = 90))+
+  theme_pem()+
+  scale_fill_discrete_sequential(palette = "Light Grays")
+
+trDat_slices <- trDat %>%
+  group_by (slice) %>%
+  dplyr::summarise(n.transect = length(unique(transect_id)),
+                   n.sites = length(unique(tid))) %>% 
+  pivot_longer(cols = c("n.transect", "n.sites"), names_to = "type", values_to = "number")
+
+ggplot(trDat_slices, aes(slice, number, fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  theme(axis.text.x = element_text(angle = 90))+
+  theme_pem()+
+  scale_fill_discrete_sequential(palette = "Light Grays")
+
+```
+
+
+```{r cv and test loop, include = FALSE, echo = FALSE, eval =TRUE}
+# format data for model by removing covars with NA values 
+
+trDat_all <- trDat[complete.cases(trDat[ , 7:length(trDat)]),]
+
+# create a subset of data by removing any variables not in model (required for model to run without error) 
+
+trDat <- trDat_all %>%
+    dplyr::select(-any_of("bgc_cat")) %>%
+    mutate(slice = as.factor(slice)) 
+
+trDat <- trDat %>%
+   filter(!is.na(tid)) #%>%
+  # mutate(slices_char = as.character(slice))
+
+# Cross validation loop based on slices 
+slices <- unique(trDat$slice) %>% droplevels()
+
+ # k = levels(slices)
+
+  if(length(slices)<2){ # switching to transect iteration instead of slices
+        
+        trDat_key <- trDat %>%
+          dplyr::select(c(tid)) %>%
+          distinct() %>%
+          mutate(slice = as.factor(seq(1,length(tid),1)))
+        
+        trDat <- trDat %>%
+          dplyr::select(-slice) %>%
+          left_join(trDat_key)
+        
+        slices <- unique(trDat$slice) %>% droplevels()
+        
+      }
+
+
+# for all slices
+sresults <- foreach(k = levels(slices)) %do% {
+  
+  #k = levels(slices)[1]
+  print(k)
+
+  # test set
+  BGC_test <- trDat %>% filter(slice %in% k) 
+  BGC_test_all <- BGC_test # keep for the target2 alt call. 
+  BGC_test_transect_no <- length(unique(BGC_test_all$transect_id))
+  
+  BGC_test <- BGC_test %>%
+    dplyr::select(-slice,-target2, -tid, -transect_id) %>%
+     droplevels()
+  
+  # training set
+  BGC_train <- trDat %>% dplyr::filter(!slice %in% k) %>%
+    filter(is.na(target2)) # train only on pure calls
+  BGC_train <- BGC_train %>%
+    dplyr::select(-slice, -target2, -tid, -transect_id) %>%
+    droplevels()
+
+  ############### Define test recipes and workflow ###################
+  
+  null_recipe <- set_recipe(BGC_train, ds_ratio  = ds_ratio, sm_ratio = sm_ratio)  
+ 
+ # # testing forest non-forest split
+  
+ # null_recipe <-
+#    recipe(target ~ ., data = BGC_train) %>%
+#    update_role(tid, new_role = "id variable")%>%
+#    step_dummy(forest_nonforest, one_hot = TRUE) %>%
+#    step_downsample(target, under_ratio = ds_ratio) %>%
+#    step_smote(target, over_ratio = sm_ratio, neighbors = 2)    #prep()
+  
+  #summary(null_recipe)
+  
+  if(length(levels(slices))<5) {
+   vv = 5
+   # vv = 3
+  } else {vv = 10}
+ 
+    #vv = 2 # testing line for quick model check 
+
+  set.seed(345)
+  # pem_cvfold <- group_vfold_cv(
+  #   BGC_train,
+  #   v = vv,
+  #   ### need to build a check for number of tids available to automatically reduce this number where necessary # problem with essfmcw
+  #   repeats = 5,
+  #   group = tid,
+  #   strata = target
+  # )
+  
+    pem_cvfold <- vfold_cv(
+    BGC_train,
+    v = vv,
+    repeats = 5,
+    strata = target
+  )
+  
+  #summary(pem_cvfold)
+  
+  randf_spec <- rand_forest(mtry = 10, min_n = 2, trees = 200) %>% 
+    set_mode("classification") %>%
+    set_engine("ranger", importance = "permutation", verbose = FALSE) 
+    
+  ## trees = 200 is approximately good metrics improve by 1% going 100 -> 200 but go down at higher ntrees
+  
+  pem_workflow <- workflow() %>%
+    add_recipe(null_recipe) %>%
+    add_model(randf_spec)
+  
+  #######################################################
+  
+  set.seed(4556)
+  #doParallel::registerDoParallel() 
+  # note when smoting with fit_resample you cant use parrallel process or will cause error
+  
+  cv_results <- fit_resamples(pem_workflow,
+                              resamples = pem_cvfold,
+                              control = control_resamples(save_pred = TRUE))
+  
+  # collect metrics
+  cv_metrics <- cv_results  %>% collect_metrics(summarize = FALSE)
+  cv_metrics_sum <- cv_results %>% collect_metrics()
+  
+  # collect predictions
+  cv_pred_sum <- cv_results %>% collect_predictions(summarize = TRUE)
+  cv_pred_sum <- cv_pred_sum %>% dplyr::select(target, .pred_class)
+  
+  #identical(levels(cv_pred_sum$target),
+  #          levels(cv_pred_sum$.pred_class))
+  
+  ## CV model accuracy metrics
+  cv_pred_sum <- as.data.frame(cv_pred_sum)
+  
+  cv_acc <- acc_metrix(cv_pred_sum) %>%
+    mutate(slice = k, 
+           transect_no = BGC_test_transect_no,
+           acc_type = "cv_estimate")
+  
+ ## build final train model and predict test data and compare acc_metrix to cv results
+
+  PEM_rf1 <- fit(pem_workflow, BGC_train)
+  final_fit <- extract_fit_parsnip(PEM_rf1) # %>%pull(.predictions)
+  
+  oob  <- round(PEM_rf1$fit$fit$fit$prediction.error, 3)
+
+  ######### Predict Test
+  #test_target <- as.data.frame(BGC_test$target) %>% rename(target = 1)
+  test_target <- BGC_test_all %>% dplyr::select(target, target2)
+
+  test.pred <-  predict(PEM_rf1, BGC_test)
+
+  test.pred <- cbind(test_target, test.pred) %>% 
+    mutate_if(is.character, as.factor)
+  # levels(train.pred$target)
+  
+  ###harmonize levels
+  targ.lev <- levels(test.pred$target)
+  pred.lev <- levels(test.pred$.pred_class)
+  levs <- c(targ.lev, pred.lev) %>% unique()
+  test.pred$target <- factor(test.pred$target, levels = levs)
+  test.pred$.pred_class <- factor(test.pred$.pred_class, levels = levs)
+  # output test predictions
+  test.pred.out <- test.pred %>% mutate(slice = k)
+     
+  # train.acc <- acc_metrix(train.pred) %>% rename(train = .estimate)
+  test.acc <- acc_metrix(test.pred) %>%
+       mutate(slice = k, 
+            transect_no = BGC_test_transect_no,
+            acc_type = "test_estimate", 
+            oob = oob)
+  
+  ## compare cv stats to test stats
+  acc.compare <- bind_rows(cv_acc, test.acc)
+
+  return(list(acc.compare, test.pred.out))
+}
+
+#pem_workflow
+
+# extract results from sresults
+pred_matrix <- lapply(sresults, function(x) x[[2]])
+acc_results <- lapply(sresults, function(x) x[[1]])
+
+acc <- as.data.frame(rbindlist(acc_results))
+test.pred <- as.data.frame(rbindlist(pred_matrix)) 
+
+#save(acc, file = paste(paste0(".", outDir), "model_results.RData", sep = "/"))
+save(acc, file = paste(outDir, "model_results.RData", sep = "/"))
+
+#write.csv(acc, file = paste(paste0(".", outDir), "acc_results.csv",sep = "/"))
+write.csv(acc,  file = paste(outDir, "acc_results.csv"))
+
+# add final model - all output here. 
+
+ ############### Define test recipes and workflow ###################
+  
+final_data <- trDat %>% dplyr::select(-c(tid,transect_id, target2, slice))
+ 
+final_recipe <- set_final_recipe(final_data, ds_ratio = ds_ratio, sm_ratio = sm_ratio )
+
+#
+#final_recipe <-
+#   recipe(target ~ ., data = final_data) %>%
+#    step_dummy(forest_nonforest, one_hot = TRUE) %>%
+#    step_downsample(target, under_ratio = ds_ratio) %>%
+#    step_smote(target, over_ratio = sm_ratio, neighbors = 2)
+
+pem_workflow <- workflow() %>%
+    add_recipe(final_recipe) %>%
+    add_model(randf_spec)
+  
+PEM_final <- fit(pem_workflow, final_data)
+
+# write out model
+saveRDS(PEM_final, file = paste(paste0(".", outDir), "final_tmodel.RDATA",sep = "/"))
+saveRDS(PEM_final, file = paste(paste0(".", outDir), "final_tmodel.rds",sep = "/"))
+
+#acc = read.csv("D:\\PEM_DATA\\BEC_DevExchange_Work\\Deception_AOI\\3_maps_analysis\\models\\forest\\fore_mu_bgc\\64\\SBSmc2\\acc_results.csv")
+
+```
+
+
+```{r report workflow, include = FALSE}
+pem_workflow
+
+```
+
+
+## Test Accuracy metrics
+
+This table contains a weighted mean and standard deviation (based on number of transects per slice, and bootstrapped by slice. 
+
+
+```{r final test results, include = TRUE, echo = FALSE, eval = TRUE}
+
+# confidence interval based on average prediction confus
+
+conf_matrix <- test.pred %>% 
+   conf_mat(target, .pred_class) %>%
+   pluck(1) %>%
+   as_tibble() %>%
+   ggplot(aes(Prediction, Truth, alpha = n)) +
+   geom_tile(show.legend = FALSE) +
+   geom_text(aes(label = n), colour = "black", alpha = 1, size = 3) + 
+   theme(axis.text.x = element_text(angle = 90)) + 
+   labs(main = "Example Test Confusion Matrix")
+    
+ conf_matrix
+
+```
+
+```{r variable importance, include = TRUE, echo = FALSE, eval = TRUE}
+### Variable importance plot
+
+# 1) basic model all covars 
+randf_final <- rand_forest(mtry = 20, min_n = 2, trees = 1000) %>%
+   set_mode("classification") %>%
+   #set_engine("ranger", importance = "permutation") 
+   set_engine("ranger", importance = "impurity") 
+
+trDat_final <- trDat %>% dplyr::select(-c(target2, slice,tid, transect_id))
+
+# update recipe with all data 
+
+vip_recipe <- set_recipe(trDat_final, ds_ratio  = ds_ratio, sm_ratio = sm_ratio)
+
+# # calculate the final variable importance per model
+ final_vip <- workflow() %>%
+   add_recipe(vip_recipe) %>%
+   add_model(randf_final) %>%
+   fit(trDat_final) 
+ 
+ # report final VIP oob - all values 
+oob_final_vip <- round(final_vip$fit$fit$fit$prediction.error, 3)
+oob_final_vip 
+
+final_vip <- final_vip %>%
+   pull_workflow_fit() %>%
+   vip(num_feature = 40)
+
+final_vip
+
+
+## 2) calculate final VIP with uncorrelated variables
+## # remove highly correlated variables
+
+# descrCor <- cor(trDat_final[,-(1:2)])
+# highlyCorDescr <- findCorrelation(descrCor, cutoff = 0.80, verbose = FALSE, names = TRUE)
+# col.to.rm <- c(highlyCorDescr)
+# 
+# trDat_final = trDat_final %>% 
+#   dplyr::select(names(trDat_final)[!names(trDat_final) %in% col.to.rm])    
+# 
+# vip_recipe <-
+#     recipe(target ~ ., data = trDat_final) %>%
+#     update_role(tid, new_role = "id variable") %>%
+#     step_downsample(target, under_ratio = 25) %>%
+#     step_smote(target, over_ratio = 1, neighbors = 2)
+# 
+# tic()
+# final_vip_model <- workflow() %>%
+#    add_recipe(vip_recipe) %>%
+#    add_model(randf_final) %>%
+#    fit(trDat_final) #%>%
+# 
+#  # report final VIP oob 
+# oob_final_vip_uc  <- round(final_vip_model$fit$fit$fit$prediction.error, 3)
+# oob_final_vip_uc 
+# 
+# # plot Vip
+# final_vip_uc_wf <- final_vip_model %>%
+#    pull_workflow_fit() 
+# 
+# final_vip_uc <- final_vip_uc_wf %>%
+#    vip(num_feature = 20) 
+# 
+# final_vip_uc
+# 
+# 
+# # keep top 6 models and compare
+# vi <- vi(final_vip_uc_wf)
+# vi <- vi[1:6,1] # remove from 7 onwards 
+# 
+# vi <- c("target", "tid", pull(vi))
+# 
+# trDat_final_vip = trDat_final %>% 
+#   dplyr::select(names(trDat_final)[names(trDat_final) %in% vi])    
+# 
+# # fix model and 
+# vip_recipe <-
+#     recipe(target ~ ., data = trDat_final_vip) %>%
+#     update_role(tid, new_role = "id variable") %>%
+#     step_downsample(target, under_ratio = 25) %>%
+#     step_smote(target, over_ratio = 1, neighbors = 2)
+# 
+# final_six_vip_model <- workflow() %>%
+#    add_recipe(vip_recipe) %>%
+#    add_model(randf_final) %>%
+#    fit(trDat_final_vip) 
+#  
+#  # report final VIP oob 
+# oob_six_vip_uc  <- round(final_six_vip_model$fit$fit$fit$prediction.error, 3)
+# oob_six_vip_uc 
+
+# plot Vip
+#final_six_vip <- final_six_vip_model  %>%
+#   pull_workflow_fit()  %>%
+#   vip() 
+
+#final_six_vip
+
+
+```
+  
+
+```{r define models with tuning parameter option, echo = FALSE, eval= FALSE}
+# 2: Optional:  Perform model hyperparameter tuning (optional)   
+
+Select model and tune the parameters, note this is time consuming. Model tuning is performed the resampled data by splitting each fold into analysis and assessment components. For each candidate model we should retune the model to select the best fit. However due to the intense computation and time we will tune the model only once for each candidate model and check results with full 10 x 5 CV tuning. Tuning outputs are inspected to assess the best hyperparameters for the given model based on a chosen meaure of accuracy (ie accuracy, j_index, roc). Once the hyperparamters are selected we update the model and apply this to the entire resampled dataset.  Two methods are available
+
+randf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>%
+#randf_spec <- rand_forest(mtry = 20, min_n = 2, trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity") #or "permutations
+
+# mtry = how many leaves to you sample at each tree
+# trees = number of trees, just need enough
+# min_n = how many data points need to be in node before stop splitting
+
+pem_workflow <- workflow() %>%
+    add_recipe(uni_recipe) %>%
+    add_model(randf_spec)
+
+cv_metrics <- metric_set(accuracy, roc_auc, j_index)
+
+set.seed(345)
+pem_cvfold <- vfold_cv(trDat, 
+                          v = 10, 
+                          repeats = 3, 
+                          strata = target)
+
+
+# Two methods are available for tuning; 1) basic grid and 2) regular grid. 
+# For Random Forest we are using regular grid tune to assess hyperparameters. 
+
+# Tune the model
+# ##https://www.youtube.com/watch?v=ts5bRZ7pRKQ
+# https://www.tidymodels.org/start/case-study/
+# http://www.rebeccabarter.com/blog/2020-03-25_machine_learning/
+#install.packages("tictoc")
+
+library(tictoc)
+
+# # look at more bound options (ie c(2, 6, 10))
+ranger_tune_detail <-
+  grid_regular(
+    mtry(range = c(2, 40)),
+    min_n(range = c(2, 10)),
+    levels = 5)
+
+# # re-run the tuning with the explicit parameter sets
+tic()
+set.seed(4556)
+doParallel::registerDoParallel()
+ranger_tune <-
+  tune_grid(pem_workflow,
+            resamples = pem_cvfold,
+            #metrics = cv_metrics,
+            grid = ranger_tune_detail)
+toc()
+
+saveRDS(ranger_tune, file = paste(paste0(".", outDir), "parameter_tune_results.rds", sep = "/"))
+
+# explore ranger tune output
+ranger_tune %>%
+  dplyr::select(.metrics) %>%
+  unnest(cols = c(.metrics))
+
+# explore results of tuning models note different for type of model selected
+select_best(ranger_tune, metric = "accuracy")
+select_best(ranger_tune, metric = "roc_auc")
+#select_best(ranger_tune, metric = "j_index")
+
+autoplot(ranger_tune)
+
+# Plot the impact of different values for the hyperparamters. note these are randomly selected for the number of grids specified (ie. grid = 20).
+# This provides an overview of the impact of ech tune paramter. Note this provides an overview as we dont know what min_n was each mtry etc...
+# this can be used to set up the tune grid paramter
+
+ranger_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  dplyr::select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+               values_to = "value",
+               names_to = "parameter") %>%
+  ggplot(aes(value, mean, colour = parameter)) +
+  geom_point(show.legend = FALSE)+
+  facet_wrap(~parameter)
+
+
+# for the 30 m standard pt # minimal change in mtry after 5 - 10 
+# mtry = 10, min_n = 2
+
+```
+
+    
+## Accuracy measures
+
+The overall map accuracy was calculated but determining the percent correct for each map unit by comparing transect data (held-out slice).
+
+### Types of accuracy 
+Several types of accuracy measures were calculated;
+
+1) unweighted (aspatial): this is equivalent to traditional AA where proportion of map units are compared. Aspatial_acc is the accuracy per slice (i.e total accuracy over the site). Aspatial_meanacc is the accuracy based on the average of map units (ie: 100% correct = 0% correct).
+
+2) area weighted (spatial) (spat_p): this compares spatial equivalents for the primary call for each pixal/point predicted.
+
+3) spatial primary/alt calls (spat_pa). This assigns a value if the alternate call matches the predicted call. 
+
+4) fuzzy spatially explicit accuracy: we tested an alternate accuracy measure (spat_fp) to account for calls which were similar (on the edatopic position) to the correct calls. In this case scores could be awarded for on a sliding scale from 1 (Correct) to 0 (no where close) with partial credit assigned to closely related mapunits. Note this requires a matrix which specifies the similarity between all combinations of possible calls. This was also calculated for primary and alternate calls (spat_fpa)
+
+
+## Comparison of CV and test metrics
+
+```{r, cv vs test overall accuracy with confidence intervals, echo = FALSE, eval = TRUE}
+#Compare the CV metrics to test metrics to see model fit 
+
+acc_sum <- acc %>%
+    dplyr::mutate(across(ends_with("overall"), ~.x *100)) %>%
+    dplyr::mutate(across(ends_with("meanacc"), ~.x *100)) %>%
+    dplyr::select(slice, acc_type, transect_no,
+                  aspat_p_overall,  aspat_p_meanacc, 
+                  aspat_fp_overall,  aspat_fp_meanacc,
+                  spat_p_overall, spat_p_meanacc,
+                  spat_pf_overall,  spat_pf_meanacc, 
+                  aspat_pa_overall,  aspat_pa_meanacc,
+                  aspat_fpa_overall, aspat_fpa_meanacc,
+                  spat_pa_overall,  spat_pa_meanacc,
+                  spat_fpa_overall, spat_fpa_meanacc ) %>%
+  distinct() 
+  
+acc_sum_long <- acc_sum %>%
+    pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>%
+   filter(!accuracy_type == "transect_no") %>%
+  mutate(type = case_when(
+    str_detect(accuracy_type, "aspat") ~ "aspatial",
+    str_detect(accuracy_type, "spat") ~ "spatial"))  %>%
+  mutate(type_model = case_when(
+    str_detect(accuracy_type, "_overall") ~ "area-weighted",
+    str_detect(accuracy_type, "_meanacc") ~ "unweighted")) %>%
+  mutate(accuracy_type_label = case_when(
+    str_detect(accuracy_type, "_p_") ~ "p",
+    str_detect(accuracy_type, "_pa_") ~ "pa",
+    str_detect(accuracy_type, "_fp_") ~ "fp",
+    str_detect(accuracy_type, "_pf_") ~ "fp",
+    str_detect(accuracy_type, "_fpa_") ~ "fpa")) %>%
+  mutate(type_label = paste0(type, "_", type_model))
+
+# calculate the weighted mean and st dev summary 
+
+acc_wt_ave <- acc_sum %>%
+  group_by(acc_type) %>%
+  dplyr::summarise(dplyr::mutate(across(where(is.numeric), ~ weighted.mean(.x, transect_no, na.rm = FALSE)))) %>%
+  pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "ave_wt") 
+            
+acc_wt_sd <- acc_sum %>%         
+   group_by(acc_type) %>%         
+  dplyr::summarise(mutate(across(where(is.numeric), ~ sqrt(wtd.var(.x, transect_no, na.rm = FALSE))))) %>%
+  pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "sd_wt") 
+          
+acc_wt_sum <- left_join(acc_wt_ave, acc_wt_sd ) %>%
+  filter(!accuracy_type == "transect_no") 
+
+acc_wt_sum <- acc_wt_sum  %>%
+  mutate(type = case_when(
+    str_detect(accuracy_type, "aspat") ~ "aspatial",
+    str_detect(accuracy_type, "spat") ~ "spatial")) %>%
+  mutate(type_model = case_when(
+    str_detect(accuracy_type, "_overall") ~ "area-weighted",
+    str_detect(accuracy_type, "_meanacc") ~ "unweighted")) %>%
+  mutate(accuracy_type_label = case_when(
+    str_detect(accuracy_type, "_p_") ~ "p",
+    str_detect(accuracy_type, "_pa_") ~ "pa",
+    str_detect(accuracy_type, "_fp_") ~ "fp",
+    str_detect(accuracy_type, "_pf_") ~ "fp",
+    str_detect(accuracy_type, "_fpa_") ~ "fpa")) %>%
+  mutate(type_label = paste0(type, "_", type_model))
+
+
+# set up order for plots 
+acc_sum_long$type_f = factor(acc_sum_long$type_label, levels = c("spatial_area-weighted" ,"aspatial_area-weighted", "spatial_unweighted",  "aspatial_unweighted"))
+
+acc_sum_long$accuracy_type_label = factor(acc_sum_long$accuracy_type_label, levels = c("p","pa", "fp","fpa"))
+
+
+# plot both the cv and test metrics
+p2 <- ggplot(aes(y = value, x = accuracy_type_label , fill = acc_type), data = acc_sum_long ) + 
+   geom_boxplot() +
+   facet_wrap(~type_f, scales = "free_x", nrow = 2) +
+   geom_hline(yintercept = 65,linetype ="dashed", color = "black") + 
+   ggtitle("Accuracy measures (median + quartiles)") + 
+   xlab("Mapunit") + ylab("Accuracy") + 
+   ylim(-0.05, 100)+
+   theme_pem_facet()+ 
+   scale_fill_discrete_sequential(palette = "Light Grays")
+
+p2
+
+```
+
+## Aspatial and Spatial (overall and average accuracy types)
+
+```{r, overall accuracy with confidence intervals, echo = FALSE, eval = TRUE}
+# plot only the test metrics 
+test_sum_long <- acc_sum_long %>%
+  dplyr::filter(acc_type == "test_estimate") %>%
+  left_join( acc_wt_sum )
+
+test_sum_long$accuracy_type_label = factor(test_sum_long$accuracy_type_label, levels = c("p","pa", "fp","fpa"))
+
+
+p3 <- ggplot(aes(y = value, x = accuracy_type_label), data = test_sum_long) + 
+   geom_boxplot() +
+   facet_wrap(~type_f, scales = "free_y", nrow = 2) +
+   geom_hline(yintercept = 65,linetype ="dashed", color = "black") + 
+   ggtitle("Accuracy measures (median + quartiles)") + 
+   xlab("Mapunit") + ylab("Accuracy") + 
+   ylim(-0.05, 100) +
+   #theme_bw() + 
+   theme_pem_facet() + 
+   scale_fill_discrete_sequential(palette = "Light Grays")+ 
+   geom_point(aes(y = ave_wt, x = accuracy_type_label), data = test_sum_long, shape = 5, size = 2) 
+  
+
+p3
+
+```
+
+
+## Accuracy per mapunit
+
+We can compare map unit accuracy levels to assess under or acceptable performance per map units. 
+
+```{r generate overall mapunit, echo = FALSE, eval = TRUE}
+
+# map unit plots: 
+
+mu_acc <- acc %>%
+    dplyr::select(slice, target, acc_type, transect_no,
+                 aspat_p_unit_pos, aspat_p_meanacc, 
+                 aspat_fp_unit_pos, aspat_fp_meanacc,
+                 aspat_pa_unit_pos, aspat_pa_meanacc,
+                 aspat_fpa_unit_pos,aspat_fpa_meanacc,
+                 spat_p_unit_pos, spat_p_meanacc,
+                 spat_pf_unit_pos, spat_pf_meanacc, 
+                 spat_pa_unit_pos, spat_pa_meanacc,
+                 spat_fpa_unit_pos, spat_fpa_meanacc
+                  ) %>%
+  dplyr::filter(acc_type == "test_estimate") %>%
+  pivot_longer(cols = where(is.numeric), names_to = "accuracy_type", values_to = "value") %>% filter(accuracy_type != "transect_no")
+
+
+mu_acc <- mu_acc %>%
+  mutate(type = case_when(
+    str_detect(accuracy_type, "aspat") ~ "aspatial",
+    str_detect(accuracy_type, "spat") ~ "spatial")) %>%
+  mutate(type_model = case_when(
+    str_detect(accuracy_type, "_unit_pos") ~ "mapunit",
+    str_detect(accuracy_type, "_meanacc") ~ "unweighted")) %>%
+  mutate(accuracy_type_label = case_when(
+    str_detect(accuracy_type, "_p_") ~ "p",
+    str_detect(accuracy_type, "_pa_") ~ "pa",
+    str_detect(accuracy_type, "_fp_") ~ "fp",
+    str_detect(accuracy_type, "_pf_") ~ "fp",
+    str_detect(accuracy_type, "_fpa_") ~ "fpa")) %>%
+  mutate(type_label = paste0(type, "_", type_model))
+ 
+
+mu_unit <- mu_acc %>%
+  filter(type_model == "mapunit") %>%
+  dplyr::select(-c(acc_type, type_model ))
+
+## set up order for plots 
+#bsRes_temp$type_f = factor(bsRes_temp$type_label, levels = #c("spatial_overall","aspatial_overall", "spatial_average", "aspatial_average"))
+
+mu_unit$accuracy_type_label = factor(mu_unit$accuracy_type_label, levels = c("p","pa", "fp","fpa"))
+
+
+p4 <- ggplot(aes(y = value, x = accuracy_type_label , fill = type), data = mu_unit  ) + 
+   geom_boxplot() +
+   facet_wrap(~target, scales = "free_x", nrow = 2) +
+   ggtitle("Mapunit accuracy measures ") + 
+   xlab("accuracy measure") + ylab("Proportion of Accurate calls") + 
+   ylim(-0.05, 1)+
+   theme_pem_facet()+ 
+   scale_fill_discrete_sequential(palette = "Light Grays")
+  
+
+p4
+
+
+```
+
+
+# References: 
+- https://towardsdatascience.com/modelling-with-tidymodels-and-parsnip-bae2c01c131c
+
+* [accuracy](https://yardstick.tidymodels.org/reference/accuracy.html) 
+* [roc_auc](https://yardstick.tidymodels.org/reference/roc_auc)
+* [sensitivity](https://yardstick.tidymodels.org/reference/sens.html) 
+* [specificity](https://yardstick.tidymodels.org/reference/spec.html)
+* [positive predictive value (ppv)](https://yardstick.tidymodels.org/reference/ppv.html)  
+  
+  

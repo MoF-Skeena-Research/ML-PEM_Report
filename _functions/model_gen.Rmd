@@ -1,0 +1,189 @@
+---
+title: "Machine Learning Model"
+output: html_document
+params:
+  outDir: "."
+  traindat: traindat
+  target: target
+  rseed: NA
+  infiles: infiles
+  mmu: mmu
+  mname: mname
+  
+---
+  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=FALSE,
+                      warning = FALSE, message = FALSE,
+                      results = 'show',
+                      eval = TRUE)  ## flag eval = false for quick text edits
+```
+
+```{r, echo=FALSE}
+# install.packages("mlr", dependencies = TRUE)
+library(mlr)
+library(tidyverse)
+
+## Load the data
+modDat <- params$traindat
+target <- params$target
+infiles<- params$infiles
+mmu <- params$mmu
+mname <- params$mname
+          
+## define output directory
+outDir <- params$outDir
+
+
+## Load the data : manual testing
+#modDat <- mpts
+#target <- target
+#indata <- indata
+#mmu <- mmu
+#mname <- mname
+#outDir <- outDir
+
+
+```
+
+This model uses the following parameters: 
+
+* **model reference:** `r params$mname` 
+* **mapunit:** `r mmu`
+* **training point set : **`r params$infiles`
+* **model response and covariates: ** `r names(modDat)`
+
+
+## Response variable: _`r target`_
+
+These are the response variable classes including the number in each class that we want to predict. 
+```{r,echo=FALSE}
+
+table(modDat[, target])
+
+```
+
+
+## Begin modeling 
+
+
+### Define the Task and Learner
+
+_PERHAPS -- this should be another small function or sourced other options_ 
+
+```{r, echo=FALSE}
+## use or create a random number seed -- this can be used to repeat results in future.
+if (!is.na(rseed)) {
+  set.seed(rseed) 
+  print(paste("Random number generator seed set to:", rseed))
+  } else {
+  rseed <- as.integer(Sys.time())
+  print(paste("Random number generator seed set to:", rseed))
+} 
+
+
+```
+
+```{r}
+## Create task 
+tsk <- makeClassifTask(data = modDat, target = target)
+
+## Define Learner
+lrn <- makeLearner("classif.ranger",
+                   num.trees = 500,                         ## number of trees DEFAULT: 500
+                   mtry = round(sqrt(ncol(modDat)-1)),      ## someone showed me to declare mtry this way
+                   num.threads = parallel::detectCores()*2, ## CAUTION HERE: how many threads does your machine have?
+                   importance = "impurity",                 ## collect var importance data
+                   predict.type = "prob")                   ## model will generate prob. and multi-class
+```
+
+### Complete repeated cross-fold validataion
+
+_PERHAPS -- this should be another small function or sourced other options_ 
+
+```{r}
+## Defines the validation method
+resp <- makeResampleDesc("RepCV",## repeated cross fold
+                         fold = 5,
+                         #folds = 10,   ## k-folds 5 or 10 as default.  Ideally all folds should be equal size.
+                         reps  = 3) #3)   ## note this will mean 5 x 3 iterations through the data
+
+## Execute cross validation
+cv <- mlr::resample(learner = lrn,
+               task = tsk,
+               resampling = resp)
+
+saveRDS(cv, file = paste(paste0('.', outDir), "cv_results.rds", sep = "/"))
+
+```
+
+#### Resampling results
+
+The mean mis-classification error is **`r mean(cv$measures.test$mmce)`**.
+
+
+#### Confusion Matrices 
+
+```{r}
+cf_matrix <- calculateConfusionMatrix(cv$pred,
+                                      relative = TRUE,
+                                      sums = TRUE)
+```
+
+##### Absolute matrix
+
+<div style = "font-size:10pt">
+
+```{r cf-matix, echo = FALSE}
+knitr::kable(cf_matrix$result)
+```
+
+</div>
+
+
+##### Relative Matrix
+
+<div style = "font-size:10pt">
+
+```{r cf-matix-rel, echo=FALSE}
+knitr::kable(round(cf_matrix$relative.row, 2))
+```
+
+</div>
+
+
+### Train the model
+
+The model is trained using all the data and then saved. 
+```{r}
+mod <- train(lrn, tsk)
+
+saveRDS(mod, paste(paste0('.', outDir), "model.rds", sep = "/"))
+```
+
+### Variable importance
+
+```{r var-imp, echo=FALSE}
+var_imp <- as.data.frame(mod$learner.model$variable.importance) %>%
+    rownames_to_column()
+  names(var_imp) <- c("name", "VaribleImportance")
+
+knitr::kable(var_imp %>% arrange(desc(VaribleImportance)) %>% head(., 20))
+```
+
+
+## Complete
+
+Congratulations your model has been generated. 
+
+Files are saved: 
+
+```{r, echo = TRUE}
+# outDir <- "e:/tmp/model_gen_test/" ## Testing
+fn <- as.data.frame(list.files(outDir, full.names = TRUE))
+names(fn) <- "Files"
+knitr::kable(fn)
+```
+
+

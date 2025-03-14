@@ -1,0 +1,5 @@
+require(R.ccdc.tools)
+require(terra)
+ccdc_img <- rast("name of segmented file from GEE")
+hm <- R.ccdc.tools::name_ccdec_bands(ccdc_img, 8)
+writeRaster(hm, "outputs new file with named bands")

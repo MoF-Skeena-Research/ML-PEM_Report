@@ -1,0 +1,344 @@
+---
+title: "Compare Maps"
+author: "WHMackenzie"
+date: "2025-02-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(tidyverse)
+require(ggplot2)
+require(data.table)
+require(sf)
+require(terra)
+require(tictoc)
+require(gt)
+
+```
+## Import old exPEM and TEM maps and crop mlPEM for comparative map unit summaries
+```{r align maps}
+mlPEM_exPEM <- vect("./outputs/mlPEM_in_exPEM.gpkg")##mlPEM in the exPEM area
+mlPEM_TEM <- vect("./outputs/mlPEM_in_TEM.gpkg")## mlPEM in the TEM area
+#shared_TEM <- vect("./outputs/TEM_Deception.gpkg")
+TEM_poly_area <- fread("./outputs/TEM_polygon_areas.csv")##export for later summarizing
+exPEM_mlPEM <- vect("./outputs/mlPEM_in_exPEM.gpkg") ##exPEM in the mlPEM area
+#plot(shared_PEM)
+transects <- vect("./inputs/allpts.gpkg")
+#mlPEM.raster <- rast("./inputs/demraw.sdat")
+#exPEM.raster <- rasterize(shared_PEM, mlPEM.raster, field = "response_combo_bcgs_key_all_x")
+#plot(exPEM.raster)
+
+```
+
+## Summarize exPEM map units
+```{r exPEM summary}
+file_path <- "./outputs/ExPEM_in_Deception.gpkg"
+exPEM <- vect(file_path)
+exPEM_areas <- values(exPEM) %>% rename(mapunit = response_combo_bcgs_key_all_x) %>%
+  mutate(mapunit =recode(mapunit, ESSFmc_nf = "ESSFmc_00",
+         "ESSFmc_31" = "ESSFmc_nf",
+         "ESSFmc_82" = "ESSFmc_nf",
+         "ESSFmc_00" = "ESSFmc_nf",
+         "SBSmc2_00" ='SBSmc2_nf',
+         "SBSmc2_12" = 'SBSmc2_nf', 
+         "SBSmc2_31" = 'SBSmc2_nf', 
+         "SBSmc2_82" = 'SBSmc2_nf',
+         "ESSFmcw_00"= 'ESSFmcw_nf',
+         "ESSFmcw_31"= 'ESSFmcw_nf',
+         "ESSFmcw_01"= 'ESSFmcw_101',
+         "ESSFmcw_02"= 'ESSFmcw_102',
+         "ESSFmcw_03"= 'ESSFmcw_103',
+         "ESSFmcw_04"= 'ESSFmcw_110',
+         "ESSFmcw_05"= 'ESSFmcw_111',
+         "ESSFmcp_00"= 'ESSFmcw_nf',
+         "SBSdk_01" = "SBSmc2_01"
+           )) %>%
+  group_by(mapunit) %>% 
+  summarise(total_area = round((sum(area)/10000),1)) %>% filter(total_area>1)
+fwrite(exPEM_areas, "./outputs/exPEM_areas.csv")
+exPEM_areas_gt <- gt(exPEM_areas) %>%
+  gt::tab_header(
+    title = "Area by Map Unit"
+  )%>%
+  grand_summary_rows(
+     columns = c(total_area),
+    fns = list(Grand_Total = ~sum(.)),
+    formatter = fmt_number,
+    decimals = 2
+  )
+#exPEM_areas_gt
+exPEM_areas$BGC <- str_extract(exPEM_areas$mapunit, "^[A-Za-z]+")
+exPEM_areas_gg <- ggplot(exPEM_areas, aes(x = mapunit, y = total_area, fill = BGC)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "Map Unit", y = "Area", title = "Map Unit - exPEM")+
+  facet_wrap(~BGC, scales = "free")
+exPEM_areas_gg 
+  ggsave("./outputs/map_unit_area_in_exPEM.png")
+```
+## Summarize TEM map units
+
+
+```{r summarize TEM by map unit}
+file_path <- "./outputs/TEM_in_Deception.gpkg"
+TEM <- vect(file_path)
+TEM_areas <- values(TEM) %>% select(BGC_LBL, SITES_LBL1, SDEC_1, SITES_LBL2, SDEC_2, SITES_LBL3, SDEC_3,area) %>%
+  mutate(map1 = paste(BGC_LBL, "_", SITES_LBL1),
+         map2 = paste(BGC_LBL,  "_", SITES_LBL2),
+         map3 = paste(BGC_LBL,  "_", SITES_LBL3)) %>% rowwise() %>% 
+  mutate(map1_area = (SDEC_1/10 * area),
+          map2_area = (SDEC_2/10 * area), 
+          map3_area = (SDEC_3/10 * area)) %>% ungroup
+TEM_areas <- TEM_areas  %>%
+  mutate(across(starts_with("map"), ~ gsub("_+$", "NA", .))) %>% 
+    mutate(across(starts_with("map"), ~ gsub("\\s+", "", .)))
+map1 <- TEM_areas %>% select(map1, map1_area) %>% rename(mapunit = map1, area = map1_area)
+map2 <- TEM_areas %>% select(map2, map2_area)%>% rename(mapunit = map2, area = map2_area)
+map3 <- TEM_areas %>% select(map3, map3_area)%>% rename(mapunit = map3, area = map3_area)
+TEM_areas2 <- rbind(map1,map2,map3) %>% data.frame %>% mutate(area = as.numeric(area)) %>% 
+mutate(mapunit =recode(mapunit, "ESSFmc_00" = "ESSFmc_nf",
+         "ESSFmc_31" = "ESSFmc_nf",
+         "ESSFmc_82" = "ESSFmc_nf",
+          "ESSFmc_81" = "ESSFmc_nf",
+         "ESSFmc_00" = "ESSFmc_nf",
+         "SBSmc2_00" ='SBSmc2_nf',
+         "SBSmc2_12" = 'SBSmc2_nf', 
+         "SBSmc2_31" = 'SBSmc2_nf', 
+         "SBSmc2_82" = 'SBSmc2_nf',
+          "SBSmc2_81" = 'SBSmc2_nf',
+         "ESSFmcw_00"= 'ESSFmcw_nf',
+         "ESSFmcw_31"= 'ESSFmcw_nf',
+         "ESSFmcw_01"= 'ESSFmcw_101',
+         "ESSFmcw_02"= 'ESSFmcw_102',
+         "ESSFmcw_03"= 'ESSFmcw_103',
+         "ESSFmcw_04"= 'ESSFmcw_110',
+         "ESSFmcw_05"= 'ESSFmcw_111',
+         "ESSFmcp_00"= 'ESSFmcw_nf',
+         "SBSdk_01" = "SBSmc2_01"
+           )) %>%  
+  group_by(mapunit) %>%
+  summarise(total_area = round(sum(area, na.rm = TRUE)/10000,0)) %>% filter(total_area>0)
+  
+fwrite(TEM_areas2, "./outputs/TEM_areas.csv")#plot(shared_PEM)
+
+TEM_areas_gt <- gt(TEM_areas2) %>%
+  gt::tab_header(
+    title = "Area by Map Unit"
+  )%>%
+  grand_summary_rows(
+     columns = c(total_area),
+    fns = list(Grand_Total = ~sum(.)),
+    formatter = fmt_number,
+    decimals = 2
+  )
+#TEM_areas_gt
+TEM_areas2$BGC <- str_extract(TEM_areas2$mapunit, "^[A-Za-z]+")
+TEM_areas_gg <- ggplot(TEM_areas2, aes(x = mapunit, y = total_area, fill = BGC)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "Map Unit", y = "Area", title = "Map Unit - TEM")+
+  facet_wrap(~BGC, scales = "free")
+TEM_areas_gg 
+  ggsave("./outputs/map_unit_area_in_exPEM.png")
+
+```
+### summarize the mlPEM map unit in the two previous maps (exPEM and TEM)
+
+```{r compare maps ratio, echo=FALSE}
+shared_PEM <- vect( "./outputs/mlPEM_in_exPEM.gpkg")
+shared_PEM_areas <- values(shared_PEM) %>% rename(mapunit = response_combo_bcgs_key_all_x) %>%
+  mutate(mapunit =recode(mapunit, "A" = "nf",
+        "F" = "nf",
+         "Non_veg" = "nf",
+          "R" = "nf",
+         "W" = "nf",
+         "W_t" = "nf",
+         "Wat" = "nf",
+         "Wb" = "nf",
+         "X" = "nf",
+         "SBSmc2_10a" = "SBSmc2_10",
+        "SBSmc2_10b" = "SBSmc2_10"
+           )) %>%
+  mutate(mapunit = ifelse(mapunit %in% "nf", paste0(MAP_LABEL,"_",mapunit), mapunit)) %>%
+  group_by(mapunit) %>%
+  summarise(total_area = round((sum(area)/10000),1))
+fwrite(shared_PEM_areas, "./outputs/mlPEM_areas_in_exPEM.csv")
+shared_PEM_areas_gt <- gt(shared_PEM_areas) %>%
+  gt::tab_header(
+    title = "Area by Map Unit"
+  )%>%
+  grand_summary_rows(
+     columns = c(total_area),
+    fns = list(Grand_Total = ~sum(.)),
+    formatter = fmt_number,
+    decimals = 2
+  )
+#shared_PEM_areas_gt
+shared_PEM_areas$BGC <- str_extract(shared_PEM_areas$mapunit, "^[A-Za-z]+")
+shared_PEM_areas_gg <- ggplot(shared_PEM_areas, aes(x = mapunit, y = total_area, fill=BGC)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "Map Unit", y = "Area", title = "Map Unit Area - mlPEM in exPEM area")+
+  facet_grid(~BGC, scales = "free")
+shared_PEM_areas_gg 
+  ggsave("./outputs/mlPEM_map_unit_area_in_exPEM.png")
+  
+shared_TEM <- vect( "./outputs/mlPEM_in_TEM.gpkg")
+shared_TEM_areas <- values(shared_TEM) %>% rename(mapunit = response_combo_bcgs_key_all_x) %>%
+    mutate(mapunit =recode(mapunit, "A" = "nf",
+        "F" = "nf",
+         "Non_veg" = "nf",
+          "R" = "nf",
+         "W" = "nf",
+         "W_t" = "nf",
+         "Wat" = "nf",
+         "Wb" = "nf",
+         "X" = "nf",
+         "SBSmc2_10a" = "SBSmc2_10",
+        "SBSmc2_10b" = "SBSmc2_10"
+           )) %>%
+  mutate(mapunit = ifelse(mapunit %in% "nf", paste0(MAP_LABEL,"_",mapunit), mapunit)) %>% 
+  group_by(mapunit) %>%
+  summarise(total_area = round((sum(area)/10000),1))
+fwrite(shared_TEM_areas, "./outputs/mlPEM_areas_in_TEM.csv")
+shared_TEM_areas_gt <- gt(shared_TEM_areas) %>%
+  gt::tab_header(
+    title = "Area by Map Unit"
+  )%>%
+  grand_summary_rows(
+     columns = c(total_area),
+    fns = list(Grand_Total = ~sum(.)),
+    formatter = fmt_number,
+    decimals = 2
+  )
+#shared_TEM_areas_gt
+shared_TEM_areas$BGC <- str_extract(shared_TEM_areas$mapunit, "^[A-Za-z]+")
+shared_TEM_areas_gg <- ggplot(shared_TEM_areas, aes(x = mapunit, y = total_area, fill = BGC)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "Map Unit", y = "Area", title = "Map Unit Area - mlPEM in TEM area")+
+  facet_grid(~BGC, scales = "free")
+shared_TEM_areas_gg 
+  ggsave("./outputs/mlPEM_map_unit_area_in_TEM.png")  
+```
+## compare composition between different maps
+```{r compare exPEM to mlPEM}
+# Merge the two dataframes by map unit
+exPEM_areas <- fread("./outputs/exPEM_areas.csv")
+shared_PEM_areas <- fread( "./outputs/mlPEM_areas_in_exPEM.csv")
+merged_df <- merge(exPEM_areas, shared_PEM_areas, by = "mapunit", suffixes = c("_exPEM", "_mlPEM"),all = TRUE) %>% 
+  tidyr::pivot_longer(cols=c(2, 3), names_to='variable', 
+values_to="value")
+merged_df$BGC <- str_extract(merged_df$mapunit, "^[A-Za-z]+")
+ggplot(merged_df, aes(x=mapunit, y=value, fill=variable)) +
+    geom_bar(stat='identity', position='dodge')+
+  labs(x = "Map Unit", y = "Total Area", title = "Comparing exPEM to mlPEM Area by Map Unit") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(~BGC, scales = "free") +
+  scale_fill_manual(name = "Dataset", values = c("total_area_exPEM" = "blue", "total_area_mlPEM" = "red"))
+
+# Save the plot as a PNG file
+ggsave("comparative_bar_chart.png")
+```
+## Spatial match between transects and exPEM
+```{r match exPEM to transects mapunits}
+## intersect allpts with exPEM.raster
+transects<- fread("./outputs/transects_in_exPEM.csv") %>% as.data.frame
+transects <- transects %>%
+  mutate(mapunit1 = gsub("/", "_", mapunit1),
+         mapunit2 = gsub("/", "_", mapunit2),
+         MapUnit = gsub("/", "_", MapUnit)) %>% 
+      mutate(mapunit1 =recode(mapunit1, "Am" = "nf",
+        "SK" = "nf",
+         "Non_veg" = "nf",
+          "Ro" = "nf",
+        "Wb" = "nf",
+        "Was" = "nf",
+         "Ww" = "nf",
+         "Wf" = "nf",
+         "Wm" = "nf",
+         "Ws" = "nf",
+         "RO" = "nf",
+        "Shallow pool" = "nf",
+        "Xvs" = "nf",
+        "Fl" = "nf",
+        "Xvh" = "nf",
+        "Xvt" = "nf",
+        "Creek" = "nf",
+        "Stream 3m width" = "nf",
+         "SBSmc2_01c" = "SBSmc2_01",
+               "SBSmc2_10a" = "SBSmc2_10",
+        "SBSmc2_10b" = "SBSmc2_10",
+        "ESSFmc_31" = "nf",
+        'ESSFmcw_101a' = "ESSFmcw_101"
+           )) %>%
+       mutate(mapunit2 =recode(mapunit2, "Am" = "nf",
+        "SK" = "nf",
+         "Non_veg" = "nf",
+          "Ro" = "nf",
+         "Ww" = "nf",
+         "Wf" = "nf",
+         "Wm" = "nf",
+        "Was" = "nf",
+         "Ws" = "nf",
+        "Wb" = "nf",
+         "RO" = "nf",
+        "Shallow pool" = "nf",
+        "Xvs" = "nf",
+        "Fl" = "nf",
+        "Xvh" = "nf",
+        "Xvt" = "nf",
+        "Creek" = "nf",
+        "Stream 3m width" = "nf",
+         "SBSmc2_01c" = "SBSmc2_01",
+          "SBSmc2_10a" = "SBSmc2_10",
+        "SBSmc2_10b" = "SBSmc2_10",
+        "ESSFmc_31" = "nf",
+        'ESSFmcw_101a' = "ESSFmcw_101"
+           ))  %>%
+  mutate(mapunit1 = ifelse(mapunit1 %in% "nf", paste0(BGC_LBL,"_",mapunit1), mapunit1)) %>% 
+    mutate(mapunit2 = ifelse(mapunit2 %in% "nf", paste0(BGC_LBL,"_",mapunit2), mapunit2)) %>% 
+  as.data.table
+
+##---This chunk to create fuzzy matrix comparison
+# unique_pairs <- transects %>% ungroup %>% 
+#   select(mapunit1, mapunit2, MapUnit) %>%
+#   pivot_longer(cols = c(mapunit1, mapunit2), names_to = "mapunit_type", values_to = "mapunit") %>%
+#   filter(!is.na(mapunit)) %>% 
+#   distinct(mapunit, MapUnit) %>% filter(!mapunit == "") %>% as.data.table
+# #build fuzzy matrix and read back in
+# fuzzy1 <- fread("./inputs/fuzzy_matrix_basic_updated2.csv") %>% as.data.table
+# unique_pairs[fuzzy1, fuzzy := fVal, on = .(mapunit = target, MapUnit = Pred),all = TRUE]
+# ##update unique_pairs with fuzzy1 using data.table
+# fwrite(unique_pairs, "./inputs/ml_expem_fuzzy.csv", row.names = FALSE)
+
+exPEM.fuzzy <- fread("./inputs/ml_expem_fuzzy_updated2.csv") %>% as.data.table
+transects[exPEM.fuzzy, fuzzyval1 := fuzzy, on = .(mapunit1 = mapunit, MapUnit = MapUnit)]
+transects[exPEM.fuzzy, fuzzyval2 := fuzzy, on = .(mapunit2 = mapunit, MapUnit = MapUnit)]
+transects <- transects %>% as.data.frame
+transects.df <- transects%>% rowwise %>% mutate(fuzzyval = max(fuzzyval1, fuzzyval2, na.rm = TRUE)) %>% ungroup %>% as.data.frame
+transects.df <- transects.df %>% group_by(ID) %>% mutate(maxval = max(fuzzyval, na.rm = TRUE))
+transects.df2 <- transects %>% filter(Position %in% "Orig") %>% rowwise %>% mutate(fuzzyval = max(fuzzyval1, fuzzyval2, na.rm = TRUE)) %>% ungroup %>% as.data.frame
+transects.df2 <- transects.df2 %>% group_by(ID) %>% mutate(maxval = max(fuzzyval, na.rm = TRUE))
+
+accuracy.mapunit <- transects.df %>% select(ID, BGC_LBL, MapUnit, maxval) %>% distinct %>% 
+  group_by(MapUnit) %>% mutate(accuracy = sum(maxval, na.rm = TRUE)/n()) %>% select(MapUnit, accuracy) %>% distinct
+
+accuracy.bgc.best <- transects.df %>% select(ID, BGC_LBL, MapUnit, maxval) %>% distinct %>% 
+  group_by(BGC_LBL) %>% mutate(accuracy.bgc.best = sum(maxval, na.rm = TRUE)/n()) %>% select(BGC_LBL, accuracy.bgc.best) %>% distinct %>% ungroup
+
+accuracy.bgc.nofuzz <- transects.df %>% select(ID, BGC_LBL, MapUnit, maxval) %>% 
+  distinct %>% mutate(maxval = ifelse(maxval < 1, 0, 1)) %>%
+  group_by(BGC_LBL) %>% mutate(accuracy.nofuzz = sum(maxval, na.rm = TRUE)/n()) %>% select(BGC_LBL, accuracy.nofuzz) %>% distinct%>% ungroup
+
+accuracy.bgc.best.noneigh <- transects.df2 %>% select(ID, BGC_LBL, MapUnit, maxval) %>% distinct %>% 
+  group_by(BGC_LBL) %>% mutate(accuracy.bgc.best.noneigh = sum(maxval, na.rm = TRUE)/n()) %>% select(BGC_LBL, accuracy.bgc.best.noneigh) %>% distinct %>% ungroup
+accuracy.bgc.base <- transects.df2 %>% select(ID, BGC_LBL, MapUnit, maxval) %>% distinct %>% mutate(maxval = ifelse(maxval < 1, 0, 1)) %>%
+  group_by(BGC_LBL) %>% mutate(accuracy.bgc.base = sum(maxval, na.rm = TRUE)/n()) %>% select(BGC_LBL, accuracy.bgc.base) %>% distinct %>% data.frame%>% ungroup
+accuracy.bgc <- cbind(accuracy.bgc.base, accuracy.bgc.best.noneigh[,2], accuracy.bgc.nofuzz[,2], accuracy.bgc.best[,2])
+fwrite(accuracy.bgc, "./outputs/exPEM_accuracy_BGC.csv")
+
+gt::gt(accuracy.bgc)
+```
+

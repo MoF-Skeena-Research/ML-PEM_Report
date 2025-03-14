@@ -1,0 +1,386 @@
+---
+title: "Build and test accuracy of various models Deception Test Case"
+output: html_document
+params:
+  outDir: "."
+  trDat: trDat
+  target: target
+  target2: target2
+  tid: tid
+  rseed: NA
+  infiles: infiles
+  mmu: mmu
+  mname: mname
+  field_transect: field_transect
+---
+
+The is script is set up as a one off to determine the create and save BGC models with optimization of training set balancing and tuning.  This modelling script is based on the sliced data approach.
+A. For each BGC reduce variables and tune-hyperparameters
+1.  Bring in training data .gpkg for the S1 cleaned data. Should be collected by slice.
+2.  Running all covariates and non-forest groups which then get converted (after prediction) to simply non-for class
+3.  Do recursive feature selection to reduce the variable set for each BGC and save the list of variables
+4.  Tune hyper-parameters for each model and save.
+
+B. Find best balance
+1.  Run a grid of downsampling/smoting combination models and output the accuracy metrics for each combination. This can take some time to run.
+2.  Outputs will include p, pa, fuzzy, and theta metrics
+3.  Compile all balancing accuracy files and find the best for different metrics. Need to choose which metric to apply as "best" as compared to "raw" data.
+4.  Save to file for use in building final model
+
+C. Build final model  
+
+1.  Select the best balance by BGC, reduced set of features, and hyper parameter tuning and generate and save the final BGC model 
+2.  Check for under-predicted map units and then add in extra points for those units to do the final test on whether more data can improve the model (or is it a covariate/mapunit problem)
+
+```{r setup, include=FALSE, echo = FALSE}
+
+library(data.table)
+library(scales)
+library(sf)
+library(ranger)
+library(tidyverse)
+library(fasterize)
+library(stringr)
+library(dplyr)
+library(raster)
+library(readxl)
+library(foreach)
+library(tidymodels)
+library(themis)
+#library(vip)
+require(stringi)
+#library(knitr)
+library(ggplot2)
+library(janitor)
+require(ggthemes)
+library(colorspace)
+require(gridExtra)
+require(vip)
+require(here)
+require(terra)
+source(here::here('_functions', 'model_gen_tidy.R'))
+source(here::here('_functions', 'acc_metrix_WHM.R'))
+source(here::here('_functions', 'balance_recipe_WHM.R'))
+source(here::here('_functions', 'doc_theme_pem.R'))
+require(PEMr)
+require(PEMprepr)
+require(PEMmodelr)
+require(PEMsamplr)
+#install_github("bcgov/envreportutils")
+
+#library(envreportutils)
+```
+
+```{r import and combine, eval = FALSE, echo = FALSE}
+## chunk to combine all training points into one file
+# s1_pts <-  sf::st_read("./model_inputs/10_training_data/s1_transect_all_pts_att.gpkg")
+# r1_pts <-  sf::st_read("./model_inputs/10_training_data/r1_neighbours_att.gpkg") %>% filter(Position == "Orig") %>% mutate(data_type = "r1")
+# ex_pts <-  sf::st_read("./model_inputs/10_training_data/allextrapts_merged_2.gpkg")%>% mutate(data_type = "extra")
+# # # #combine data sets
+# allpts <- bind_rows(s1_pts, ex_pts)
+# allpts <- bind_rows(allpts, r1_pts)
+#st_write(allpts, "./model_inputs/10_training_data/allpoints_att.gpkg")
+# all_data <- allpts %>% data.frame
+# saveRDS(all_data, "./model_inputs/10_training_data/all_data.rds")
+```
+
+
+```{r clean up scripts, eval = FALSE, echo = FALSE}
+## need to fix the membership of some training sets
+# allpts <- st_read("./model_inputs/10_training_data/allpoints_att2.gpkg" )
+# # update mapunit1 by map.key using data.table
+# map.key  <- read.csv("./model_inputs/mapunitkey_final.csv", 
+#                        stringsAsFactor = FALSE) %>% as.data.table()
+# allpts <- as.data.table(allpts)
+# map.key <- as.data.table(map.key)
+# 
+# # Perform the joins and transformations
+# allpts <- merge(allpts, map.key, by.x = "mapunit1", by.y = "fieldcall", all.x = TRUE)
+# allpts <- merge(allpts, map.key, by.x = "mapunit2", by.y = "fieldcall", all.x = TRUE)
+# allpts[map.key, mapunit1 := basemapunit, on = c("mapunit1" = "fieldcall")]
+# allpts[map.key, mapunit2 := basemapunit, on = c("mapunit2" = "fieldcall")]
+# # return as sf object
+# allpts2 <- st_as_sf(allpts)
+# st_write(allpts2, "./model_inputs/10_training_data/allpoints_att.gpkg", append=FALSE)
+
+# %>% mutate(bgc_cat = MAP_LABEL_2, bgc = MAP_LABEL_2)
+#allpts <- st_read("./model_inputs/10_training_data/allpoints_fixed_att2.gpkg" ) %>% as.data.table
+# allpts[, mapunit1 := gsub("\\s+", "", mapunit1)]
+# allpts[, mapunit2 := gsub("\\s+", "", mapunit2)]
+# all_data <- allpts %>% mutate(mapunit1 = ifelse(bgc == "ESSFmc" & startsWith(mapunit1, "ESSFmcw") & mapunit1 =="ESSFmcw_101", "ESSFmc_01", 
+#   ifelse(bgc == "ESSFmc" & startsWith(mapunit1, "ESSFmcw") & mapunit1 =="ESSFmcw_102", "ESSFmc_02", 
+#   ifelse(bgc == "ESSFmc" & startsWith(mapunit1, "ESSFmcw") & mapunit1 =="ESSFmcw_110", "ESSFmc_06",
+#                                               mapunit1)))) %>% data.frame
+# all_data <- fread("./model_inputs/10_training_data/all_data_to_fix.csv")
+#all_data <- saveRDS(all_data, "./model_inputs/10_training_data/all_data.rds")
+
+# allpts <- allpts %>% mutate(fieldbgc = ifelse(grepl("_", transect_id), sub("_.*", "", transect_id), NA))
+# allpts <- allpts %>% mutate(bgc_cat = ifelse(fieldbgc %in% c("ESSFmc", "essfmc") & slice == "1", "ESSFmc", bgc_cat))
+# allpts <- allpts %>% mutate(bgc = ifelse(fieldbgc %in% c("ESSFmc", "essfmc") & slice == "5", "ESSFmc", bgc))
+# head(allpts)
+# slices_with_mismatch <- allpts %>% mutate(transbgc = tolower(fieldbgc), mapbgc = tolower(bgc)) %>% 
+#   filter(transbgc != mapbgc, !is.na(slice)) %>% dplyr::select(bgc, fieldbgc, slice, mapunit1)
+#   pull(slice) %>%
+#   unique()
+# slices_with_mismatch
+# 
+# allpts <- allpts %>%  mutate(bgc = ifelse(fieldbgc %in% c("ESSFmcw", "essfmcw"), "ESSFmcw", bgc))
+# allpts <- allpts %>%  mutate(bgc_cat = ifelse(fieldbgc %in% c("ESSFmcw", "essfmcw"), "ESSFmcw", bgc_cat))
+# 
+# # View the slices with mismatches
+# 
+#\ st_write(allpts, "./model_inputs/10_training_data/allpoints_att2.gpkg", append=FALSE)
+```
+
+Read in input files
+
+```{r, eval = FALSE, echo = FALSE}
+# read in map and model keys
+map.key  <- read.csv("./model_inputs/mapunitkey_final.csv", 
+                       stringsAsFactor = FALSE) %>% as.data.table()
+# map.key  <- read.csv("./_MapUnitLegend/Deception_MapUnitLegend.csv", 
+#                        stringsAsFactor = FALSE)
+# #read in the fuzzy index
+fMat <- read.csv("./model_inputs/fuzzy_matrix_basic_updated.csv") %>%
+  dplyr::select(c(target, Pred, fVal)) %>% distinct ()
+fMat <- data.table(fMat)
+bec_shp <- st_read( "./model_inputs/bec_edited.gpkg", quiet = TRUE)
+model_param <- file.path("./model_inputs/models_WHM.xlsx")
+# tpts <- st_read("./model_inputs/10_training_data/allpoints_att.gpkg") %>% filter(!is.na(mapunit1))
+# all_data <- tpts %>% data.frame
+#saveRDS(all_data, "./model_inputs/10_training_data/all_data.rds")
+
+all_data <- readRDS("./model_inputs/10_training_data/all_data.rds")
+#all_data <- read_rds("./model_inputs/10_training_data/all_data.rds") #%>% mutate(bgc_cat = bgc)
+## make sure all the map units are in the key
+#mapkey <- fread("./model_inputs/map_key_updated.csv")
+#maps.add <- all_data %>% pull(mapunit1) %>% unique %>% data.frame
+# fwrite(covs.add, "./model_inputs/maps_add.csv")
+#xx <- tpts %>% filter(is.na(mapunit1), , Position == "Orig")#%>% filter(data_type == "s1", Position == "Orig")  %>% count(bgc)
+
+```
+
+prep training set
+```{r}
+# core_names  <- covarkey |>
+#   dplyr::filter(type == "core") |>
+#   dplyr::select(value) |> dplyr::pull()
+# mcols <- names(all_data)[!names(all_data) %in% c(core_names)]
+# saveRDS(mcols, "./model_inputs/full_covariate_list.rds")
+# mcols <- readRDS("./model_inputs/full_covariate_list.rds")
+# reduced_vars_all <- reduce_features(mcols,
+#                                 covar_dir =  "model_inputs/20_covariates/model",
+#                                 covarkey = covarkey,
+#                                 covtype = c("dem", "chm", "sat"),
+#                                 cutoff = 0.90)
+# write.csv(reduced_vars_all, "./model_inputs/reduced_covariates_all.csv", row.names = FALSE)## add in 2 chm variables to the reduced list all
+#write.csv(reduced_vars, "./model_inputs/reduced_covariate_list.csv", row.names = FALSE)
+#reduced_vars <- fread("./model_inputs/reduced_covariate_list.csv") |> dplyr::pull() #DEM only
+reduced_vars <- fread("./model_inputs/reduced_covariates_all.csv") |> dplyr::pull() #all covariates
+dem_training <- all_data %>% dplyr::select(all_of(c(core_names,reduced_vars)))
+setDT(dem_training)[map.key, target := mapunit_ss_realm, on = c("mapunit1" = "basemapunit")]
+setDT(dem_training)[map.key, target2 := mapunit_ss_realm, on = c("mapunit2" = "basemapunit")]
+nf_units <- c("A", "W", "W_t", "R", "X", "F", "N")
+dem_training <- dem_training %>%  rowwise() %>%  mutate(target = ifelse(target %in% nf_units, paste0(bgc,"_",target), target))
+dem_training <- dem_training %>%  rowwise()%>%  mutate(target2 = ifelse(target2 %in% nf_units, paste0(bgc,"_",target2), target2)) %>% ungroup
+dem_training <- dem_training %>% filter(!bgc %in% c("SBSdk", "ESSFmcp")) %>% filter(!is.na(target)) %>% filter(!target %in% c("", "NV"))
+dem_training <- dem_training %>% mutate(slice = factor(slice), mapunit1 = target, mapunit2=target2) %>% rename(position = Position,  bgc = bgc, id = ID,)
+dem_training <- dem_training  %>% dplyr::select(data_type, id, bgc ,tid, transect_id, slice, position, mapunit1, mapunit2, all_of(c(reduced_vars)))
+
+```
+
+
+```{r}
+## count for each bgc_cat
+##review here for where extra points might be needed.
+count_tp <- dem_training %>% filter(data_type == "s1") %>%  dplyr::count(mapunit1, bgc)
+ggplot(count_tp, aes(reorder(mapunit1, -n), n, fill = bgc)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~bgc, scales = "free") +
+  labs(title = "Bar Plot of mapunit1 by BGC Category",
+       x = "mapunit1",
+       y = "Count",
+       fill = "BGC Category") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 70, hjust = 1)) # Rotate labels
+
+extra.required <- c('ESSFmc_02', 'ESSFmc_03', 'ESSFmc_06', 'ESSFmc_10',  'ESSFmcw_102', 'ESSFmcw_103',  'ESSFmcw_111', 'SBSmc2_02', 'SBSmc2_03', 'SBSmc2_09', 'SBSmc2_10', 'ESSFmc_W_t', 'ESSFmcw_W_t', 'SBSmc2_W_t')
+
+count_tp <- dem_training %>% filter(data_type == "extra") %>%  dplyr::count(mapunit1, bgc)
+ggplot(count_tp, aes(reorder(mapunit1, -n), n, fill = bgc)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~bgc, scales = "free") +
+  labs(title = "Bar Plot of mapunit1 by BGC Category",
+       x = "mapunit1",
+       y = "Count",
+       fill = "BGC Category") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 70, hjust = 1)) 
+
+count_tp <- dem_training %>% filter(data_type %in% c("s1", "extra")) %>%  dplyr::count(mapunit1, bgc)
+## count for each bgc_cat
+##review here for where extra points might be needed.
+ggplot(count_tp, aes(reorder(mapunit1, -n), n, fill = bgc)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~bgc, scales = "free") +
+  labs(title = "Bar Plot of mapunit1 by BGC Category",
+       x = "mapunit1",
+       y = "Count",
+       fill = "BGC Category") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 70, hjust = 1))
+
+downsample <- dem_training %>% filter(data_type %in% c("s1", "extra"))
+
+count_tp <- downsample  %>%  dplyr::count(mapunit1, bgc) %>% filter(n < 20) %>% droplevels()%>% pull(mapunit1)  
+
+downsamples <- dem_training %>%
+  filter(data_type %in% c("s1", "extra")) %>%
+  filter(!mapunit1 %in% count_tp) %>%
+  filter(!mapunit2 %in% count_tp) %>%
+  filter(!(data_type == "extra" & !endsWith(mapunit1, "01"))) %>%
+  dplyr::select( -tid, -transect_id, -slice, -position, -mapunit2, -data_type, -id)
+
+   downsamples <- recipe(mapunit1 ~ ., data = downsamples) %>%
+  update_role(bgc, new_role = "id variable") %>%
+  step_naomit(all_predictors()) %>%
+  step_downsample(mapunit1, under_ratio = 10000) %>%
+  #step_smote(mapunit1, over_ratio = .05, neighbors = 5, skip = TRUE) %>%
+  prep()
+     downsamples <- juice(downsamples)
+   count_tp <- downsamples  %>%  dplyr::count(mapunit1, bgc)   
+      ggplot(count_tp, aes(reorder(mapunit1, -n), n, fill = bgc)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~bgc, scales = "free") +
+  labs(title = "Bar Plot of mapunit1 by BGC Category",
+       x = "mapunit1",
+       y = "Count",
+       fill = "BGC Category") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 70, hjust = 1))
+```
+
+
+```{r}
+source("./_functions/build_model_raw_new.R")
+trDat <- dem_training %>% filter(data_type == "s1")
+extra_dat <- dem_training %>% filter(data_type == "extra") %>% dplyr::select(id, bgc ,tid, mapunit1,  all_of(c(reduced_vars)))
+
+## trDat=trDat ; extrarun = FALSE; model.name = ""; extradat = NULL; downsample = FALSE; smote = FALSE; use.neighbours = FALSE
+
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "base", model_type = "dem_sat_chm", extrarun = FALSE, extradat = NULL, downsample = FALSE, smote = FALSE, use.neighbours = FALSE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "extra", model_type = "dem_sat_chm",extrarun = TRUE, extradat = extra_dat, downsample = FALSE, smote = FALSE, use.neighbours = FALSE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down100",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 100, smote = FALSE, use.neighbours = FALSE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down500",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 500, smote = FALSE, use.neighbours = FALSE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1000",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1000, smote = FALSE, use.neighbours = FALSE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1500",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1000, smote = FALSE, use.neighbours = FALSE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "base_neighbor",model_type = "dem_sat_chm", extrarun = FALSE, extradat = NULL, downsample = FALSE, smote = FALSE, use.neighbours = TRUE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "extra_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = FALSE, smote = FALSE, use.neighbours = TRUE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down100_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 100, smote = FALSE, use.neighbours = TRUE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down500_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 500, smote = FALSE, use.neighbours = TRUE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1000_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1000, smote = FALSE, use.neighbours = TRUE)
+rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1500_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1500, smote = FALSE, use.neighbours = TRUE)
+```
+summary of all models
+```{r}
+intermediate_files <- list.files("./models/dem_sat_chm/acc_reports", full.names = TRUE)
+output2 <- do.call(rbind, lapply(intermediate_files, read.csv))
+# Write the final output to CSV
+write.csv(output2, "all_accuracy.csv", row.names = FALSE)
+df <- read.csv("all_accuracy.csv")
+# Group by 'balance' and 'bgc' and summarize all numeric columns
+summary <- df %>%
+  group_by(balance) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>% ungroup
+summary <-  summary %>% dplyr::select(balance,  acc, spat_paf_theta0,  aspat_paf_theta0, spat_paf_theta1,  aspat_paf_theta1, aspat_pa) %>% distinct
+# Effect of data manipulations on accuracy metrics
+cols.order <- c("base", "extra", "down1500","down1000", "down500", "down100",  "base_neighbor", "extra_neighbor", "down1500_neighbor", "down1000_neighbor", "down500_neighbor", "down100_neighbor")
+rows.order <- c("acc", "aspat_pa","spat_paf_theta0", "spat_paf_theta1", "spat_pa_theta0", "aspat_paf_theta0",  "aspat_paf_theta1")
+transposed_summary <- summary %>%
+  pivot_longer(cols = -balance, names_to = "Metric", values_to = "Value") %>%
+  pivot_wider(names_from = balance, values_from = Value) %>%
+  dplyr::select(Metric, all_of(cols.order))
+transposed_summary <- transposed_summary %>%
+  mutate(across(all_of(cols.order[-1]), ~ . - base))
+
+transposed_summary <- transposed_summary %>%
+  filter(Metric %in% rows.order) %>%
+  arrange(match(Metric, rows.order))
+transposed_summary <- transposed_summary %>%
+  mutate(across(where(is.numeric), round, 3))
+gt::gt(transposed_summary)%>%
+  gt::tab_options(
+    table.font.size = gt::px(8))
+
+```
+
+```{r build final model function}
+build_final_model <- function(trDat, model.name = "final", extrarun = TRUE, extradat = TRUE,
+                                downsample = TRUE, downratio = 1000) {
+  balance_name <- model.name
+  bgc_labels <- unique(trDat$bgc)
+  all_results <- list()
+  trDat <- trDat %>% arrange(mapunit1)
+
+  for (bgc in bgc_labels) {
+    print(paste("Processing BGC:", bgc))
+    trDat_bgc <- trDat %>% filter(bgc == !!bgc)
+
+        BGC_train <- trDat_bgc %>%
+        mutate(mapunit1 = factor(mapunit1)) %>%
+        drop_na(mapunit1) %>%
+        droplevels()
+      # Merge in extra point data if required
+      if (!extrarun) {
+        print("Adding extra points at each model build")
+        BGC_train <- BGC_train %>% filter(!data_type == "extra")
+      }
+      BGC_train <- BGC_train %>% dplyr::select(-data_type)
+      # Define recipe and model
+      if (!downsample) {
+        null_recipe <- recipe(mapunit1 ~ ., data = BGC_train) %>%
+          update_role(bgc, new_role = "id variable")
+      } else {
+        null_recipe <- recipe(mapunit1 ~ ., data = BGC_train) %>%
+          update_role(bgc, new_role = "id variable") %>%
+          step_downsample(mapunit1, under_ratio = downratio)
+      }
+
+      randf_spec <- rand_forest(trees = 151) %>%
+        set_mode("classification") %>%
+        set_engine("ranger", importance = "permutation", verbose = FALSE)
+      pem_workflow <- workflow() %>%
+        add_recipe(null_recipe) %>%
+        add_model(randf_spec)
+
+    # Fit the model
+      PEM_rf1 <- fit(pem_workflow, BGC_train)
+      final_fit <- extract_fit_parsnip(PEM_rf1)
+      oob <- round(PEM_rf1$fit$fit$fit$prediction.error, 3)
+      
+      saveRDS(PEM_rf1, paste0("./models/dem_sat_chm/rfmodels/", bgc, "_", balance_name, ".rds"))
+    
+  }
+}
+```
+
+
+
+build final BGC models for each BGC
+```{r}
+
+all_training <- dem_training %>%
+  filter(data_type %in% c("s1", "extra")) %>%
+  filter(!mapunit1 %in% count_tp) %>%
+  filter(!mapunit2 %in% count_tp) %>%
+  filter(!(data_type == "extra" & endsWith(mapunit1, "01"))) %>% 
+  filter(!(data_type == "s1" & !position == "Orig")) %>%
+  #dplyr::select(id, transect_id, bgc, slice, position,mapunit1,mapunit2, all_of(c(reduced_vars)))
+  dplyr::select(data_type, bgc, mapunit1, all_of(c(reduced_vars)))
+rf_models <-  build_final_model(trDat=all_training , model.name = "final", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1000)
+```
+
+
+
+
+

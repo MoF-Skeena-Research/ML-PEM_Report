@@ -1,0 +1,291 @@
+---
+title: "Build and test accuracy of various models Deception Test Case"
+output: html_document
+params:
+  outDir: "."
+  trDat: trDat
+  target: target
+  target2: target2
+  tid: tid
+  rseed: NA
+  infiles: infiles
+  mmu: mmu
+  mname: mname
+  field_transect: field_transect
+---
+
+Generate maps from final model builds for the Deception Test Case
+
+```{r setup, include=FALSE, echo = FALSE}
+
+library(data.table)
+library(scales)
+library(sf)
+library(ranger)
+library(tidyverse)
+library(fasterize)
+library(stringr)
+library(dplyr)
+library(raster)
+library(readxl)
+library(foreach)
+library(tidymodels)
+library(themis)
+#library(vip)
+require(stringi)
+#library(knitr)
+library(ggplot2)
+library(janitor)
+require(ggthemes)
+library(colorspace)
+require(gridExtra)
+require(vip)
+require(here)
+require(terra)
+source(here::here('_functions', 'model_gen_tidy.R'))
+source(here::here('_functions', 'acc_metrix_WHM.R'))
+#source(here::here('_functions', 'balance_recipe_WHM.R'))
+source(here::here('_functions', 'doc_theme_pem.R'))
+require(PEMr)
+require(PEMprepr)
+require(PEMmodelr)
+require(PEMsamplr)
+#install_github("bcgov/envreportutils")
+
+#library(envreportutils)
+```
+
+create tiles - only needs to be run once
+should check to see if size is optimal
+```{r create tiles}
+  get_tiles <- function(tile_dir, template, tile_size) {
+  if (!dir.exists(file.path(tile_dir))) {
+    dir.create(file.path(tile_dir))
+
+    ntiles <- terra::makeTiles(template, tile_size, filename = file.path(tile_dir, "tile_.tif"), na.rm = FALSE, overwrite = TRUE)
+
+    cli::cli_alert_info("Creating tiles")
+  } else if (dir.exists(file.path(tile_dir))) {
+    ntiles <- list.files(tile_dir, full.names = T)
+  }
+
+  return(ntiles)
+}
+
+tile_dir = "./models/tiles/"
+template <- terra::rast("./model_inputs/20_covariates/model/template.tif")
+  tiles <- get_tiles(tile_dir, template, tile_size = 1000)
+
+```
+
+Predict Map
+```{r}
+model_dir = "./models/dem_sat_chm/rfmodels"
+covars = read.csv("./model_inputs/reduced_covariates_all.csv") |>  dplyr::pull()
+cov_dir = "./model_inputs/20_covariates/model/"
+tile_dir = "./models/tiles/"
+bec_shp <- sf::st_read("./inputs/bec.gpkg", quiet = TRUE)
+map_dir = "./models/dem_sat_chm/maps"
+model_name_label = "final_dem"
+model_name = "_final.rds"
+
+  # model_type = "f";   model_dir = "./models/dem_only/rfmodels/";   model_name = "_final.rds";
+  # covars = read.csv("./model_inputs/reduced_covariate_list.csv") |>  dplyr::pull();   cov_dir = "./model_inputs/20_covariates/model/";   tile_dir = "./models/tiles/";   bec_shp <- sf::st_read("./inputs/bec.gpkg", quiet = TRUE); map_dir = "./models/dem_only/maps"
+
+# run_predict_map <- function(
+#     #model_type = "f",
+#     model_dir = "./models/dem_only/rfmodels/",
+#     model_name = "_final.rds",
+#     covars = read.csv("./model_inputs/reduced_covariate_list.csv") |>  dplyr::pull(),
+#     cov_dir = "./model_inputs/20_covariates/model/",
+#     tile_dir = "./models/tiles/",
+#     bec_shp <- sf::st_read("./inputs/bec.gpkg", quiet = TRUE),
+#     model_name_label = "final_dem") {
+  # set a list of all sub models to run (ie. BGC folders)
+  submods <- basename(fs::dir_ls(model_dir, type = "any"))
+
+  # if "tiles exist remove this as vector
+  # submods <- submods[submods != "map"]
+  # model_name_label = gsub(".rds", ".tif", model_name)
+
+  # set up raster stack
+  rast_list <- list.files(cov_dir, pattern = ".sdat$|.tif$", recursive = T, full.names = T)
+  rast_list <- rast_list[tolower(gsub(".sdat$|.tif$", "", basename(rast_list))) %in% (covars)]
+  rstack <- terra::rast(rast_list)
+   template <- terra::rast(fs::path(cov_dir, "template.tif"))
+  # get tiles for mapping
+  tiles <- get_tiles(tile_dir)#, template, 500)
+  
+  for (b in submods) {
+b="ESSFmcw"
+  #map_bgc <- purrr::map(submods, function(b) {
+    cli::cli_alert_info("Predicting {b} maps")
+
+    #mfit <- file.path(model_dir, paste0(b))#,model_name))
+    mfit <- file.path(model_dir, paste0(b, model_name))
+    model_fit <- readRDS(fs::path(mfit))
+
+    #out_dir_map <- fs::path(model_dir, b, "map")
+    out_dir_map <- fs::path(map_dir, b)
+    if (!dir.exists(fs::path(out_dir_map))) {
+      dir.create(fs::path(out_dir_map))
+    }
+require(tictoc)
+    source(here::here('_functions', 'predict_map_WHM.R'))
+    tic()
+  predict_map(model_fit, out_dir = out_dir_map, rstack = rstack, tile_dir = tile_dir, probability = FALSE, model_name_label = model_name_label)
+    toc()
+
+    pred_df <- as.data.frame(map, xy = TRUE)
+    
+     # })
+# # Extract model coefficients
+# model_fit %>% 
+#   extract_fit_parsnip() %>% 
+#   vip()
+
+# # Get independent variables
+# independent_variables <- model_coefficients %>%
+#   filter(term != "(Intercept)") %>%
+#   pull(term)
+  
+  #if (model_type == "f") {
+ #   combine_sub_maps(bec_shp, model_dir, model_name_label)
+  #}
+    
+    ### combine tiles into a single raster
+file_paths <- list.files(out_dir_map, pattern = ".tif$", recursive = T, full.names = T) #%>% as.list
+pred.tiles <- lapply(file_paths, rast)
+combined_raster <- do.call(mosaic, pred.tiles)
+bec_filter <- bec_shp |> dplyr::filter(.data$MAP_LABEL == b)
+rtemp <- terra::mask(combined_raster, terra::vect(bec_filter))
+bgc.map.name = paste0("combined_map_", b, ".tif")
+writeRaster(rtemp, file.path(out_dir_map, bgc.map.name ), overwrite=TRUE)
+keys <- utils::read.csv(fs::path(map_dir, b, "response_names.csv")) 
+ cli::cli_alert_success("Maps have been generated")
+    
+    
+  #return(TRUE)
+}
+```
+
+stitch together BGC maps
+```{r}
+combo_map <- lapply(submods, function(f) {
+     #f <- bgcs[[2]]
+tif_files <- list.files(file.path(map_dir, f, "best"), pattern = ".tif$", full.names = TRUE)
+    rtemp <- lapply(tif_files, terra::rast)
+    stacked_raster <- terra::rast(rtemp)
+#rtemp2 <- terra::rast(file.path(map_dir, f, "best"))#, pattern = ".tif$", full.names = TRUE)
+  #rtemp <- terra::rast("D:/GitHub/ML-PEM_Report/models/dem_only/maps/ESSFmcw/best/")
+    rtemp[is.na(rtemp[])] # <- 0
+    names(rtemp) <- "pred_no"
+        rsrc <- terra::sprc(combo_map)
+  m <- terra::mosaic(rsrc, fun = "max")
+```
+
+full key
+```{r}
+f = "ESSFmcw"
+  rkey <- purrr::map(submods, function(f) {
+    keys <- utils::read.csv(fs::path(map_dir, f, "response_names.csv")) |>
+      dplyr::mutate(model = f)
+  }) |> dplyr::bind_rows()
+#rkey = keys
+  rkey <- rkey |> dplyr::mutate(map.response = seq_len(nrow(rkey)))
+
+    rsrc <- terra::sprc(combo_map)
+  m <- terra::mosaic(rsrc, fun = "max")
+# file_paths <- list.files(out_dir_map, pattern = ".tif$", recursive = T, full.names = T) #%>% as.list
+# pred.tiles <- lapply(file_paths, rast)
+# combined_raster <- do.call(mosaic, pred.tiles)
+# bec_filter <- bec_shp |> dplyr::filter(.data$MAP_LABEL == b)
+# rtemp <- terra::mask(combined_raster, terra::vect(bec_filter))
+# bgc.map.name = paste0("combined_map_", b, ".tif")
+# writeRaster(rtemp, file.path(out_dir_map, bgc.map.name ), overwrite=TRUE)
+# keys <- utils::read.csv(fs::path(map_dir, b, "response_names.csv"))    
+
+
+# combine bgc maps for forested areas
+combine_sub_maps <- function(
+    bec_shp,
+    model_dir,
+    model_name_label) {
+  # set a list of all sub models to run (ie. BGC folders)
+  #submods <- basename(fs::dir_ls(model_dir, type = "directory"))
+submods <- basename(fs::dir_ls(model_dir, type = "any"))
+  # if "tiles exist remove this as vector
+  submods <- submods[submods != "map"]
+
+  ## Generate final map by joining BGC maps together
+
+  # step 1:  set up a key for the combined map (includes all the units)
+  f = "ESSFmcw"
+  rkey <- purrr::map(submods, function(f) {
+    keys <- utils::read.csv(fs::path(map_dir, f, "response_names.csv")) |>
+      dplyr::mutate(model = f)
+  }) |> dplyr::bind_rows()
+#rkey = keys
+  rkey <- rkey |> dplyr::mutate(map.response = seq_len(nrow(rkey)))
+
+
+  # Step 2: For each bgc, filter and mask the raster map and update key if needed
+
+  combo_map <- lapply(submods, function(f) {
+     #f <- bgcs[[2]]
+tif_files <- list.files(file.path(map_dir, f, "best"), pattern = ".tif$", full.names = TRUE)
+    rtemp <- lapply(tif_files, terra::rast)
+    stacked_raster <- terra::rast(rtemp)
+#rtemp2 <- terra::rast(file.path(map_dir, f, "best"))#, pattern = ".tif$", full.names = TRUE)
+  #rtemp <- terra::rast("D:/GitHub/ML-PEM_Report/models/dem_only/maps/ESSFmcw/best/")
+    rtemp[is.na(rtemp[])] # <- 0
+    names(rtemp) <- "pred_no"
+
+    # filter to only predict over bgc
+    bec_filter <- bec_shp |> dplyr::filter(.data$MAP_LABEL == f)
+
+    rtemp <- terra::mask(rtemp, terra::vect(bec_filter))
+
+    subkey <- rkey |>
+      dplyr::filter(.data$model == f) |>
+      dplyr::mutate(mosaic = as.numeric((.data$pred_no)))
+
+    # check if the key matches or needs reclassification
+    if (isTRUE(unique(subkey$mosaic == subkey$map.response))) {
+      cli::cli_alert_info("matching key")
+    } else {
+      cli::cli_alert_info("updating key")
+
+      for (i in 1:nrow(subkey)) {
+        subkey_row <- subkey[i, ]
+
+        from <- subkey_row$pred_no
+        to <- subkey_row$map.response
+
+        rtemp <- terra::subst(rtemp, from, to)
+      }
+    }
+
+    rtemp
+  })
+
+  rsrc <- terra::sprc(combo_map)
+  m <- terra::mosaic(rsrc, fun = "max")
+
+  rkey <- rkey |> dplyr::select(.data$.pred_class, .data$pred_no, .data$model, .data$map.response)
+
+  out_folder <- fs::path(model_dir, "map")
+
+  if (!dir.exists(out_folder)) dir.create(out_folder)
+
+  terra::writeRaster(m, fs::path(out_folder, model_name_label),  overwrite = TRUE)
+
+  utils::write.csv(rkey, fs::path(out_folder, "response_names.csv"))
+
+  cli::cli_alert_success("forest map merged and created and saved: {out_folder}")
+}
+```
+
+
+
+
