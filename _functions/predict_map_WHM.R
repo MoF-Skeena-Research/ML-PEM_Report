@@ -64,7 +64,9 @@ predict_map <- function(model,
         }
         #map <- terra::predict(raster_stk2, BGCmodel, fun = pfun, na.rm = TRUE)
         pred <- terra::predict(tstack, rf_fit, fun = pfun, na.rm = TRUE)
+
         pred_df <- as.data.frame(pred , xy = TRUE)
+
         # write out probability layer
         if (probability == TRUE) {
           if (!dir.exists(file.path(out_dir, "probability"))) {
