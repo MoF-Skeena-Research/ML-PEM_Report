@@ -149,8 +149,9 @@ model_param <- file.path("./model_inputs/models_WHM.xlsx")
 # tpts <- st_read("./model_inputs/10_training_data/allpoints_att.gpkg") %>% filter(!is.na(mapunit1))
 # all_data <- tpts %>% data.frame
 #saveRDS(all_data, "./model_inputs/10_training_data/all_data.rds")
+covar.key  <- read.csv("./model_inputs/covariate_key_updated.csv", 
+                       stringsAsFactor = FALSE) %>% as.data.table()
 
-all_data <- readRDS("./model_inputs/10_training_data/all_data.rds")
 #all_data <- read_rds("./model_inputs/10_training_data/all_data.rds") #%>% mutate(bgc_cat = bgc)
 ## make sure all the map units are in the key
 #mapkey <- fread("./model_inputs/map_key_updated.csv")
@@ -162,9 +163,9 @@ all_data <- readRDS("./model_inputs/10_training_data/all_data.rds")
 
 prep training set
 ```{r}
-# core_names  <- covarkey |>
-#   dplyr::filter(type == "core") |>
-#   dplyr::select(value) |> dplyr::pull()
+core_names  <- covar.key |>
+  dplyr::filter(type == "core") |>
+  dplyr::select(value) |> dplyr::pull()
 # mcols <- names(all_data)[!names(all_data) %in% c(core_names)]
 # saveRDS(mcols, "./model_inputs/full_covariate_list.rds")
 # mcols <- readRDS("./model_inputs/full_covariate_list.rds")
@@ -176,6 +177,7 @@ prep training set
 # write.csv(reduced_vars_all, "./model_inputs/reduced_covariates_all.csv", row.names = FALSE)## add in 2 chm variables to the reduced list all
 #write.csv(reduced_vars, "./model_inputs/reduced_covariate_list.csv", row.names = FALSE)
 #reduced_vars <- fread("./model_inputs/reduced_covariate_list.csv") |> dplyr::pull() #DEM only
+all_data <- readRDS("./model_inputs/10_training_data/all_data.rds")
 reduced_vars <- fread("./model_inputs/reduced_covariates_all.csv") |> dplyr::pull() #all covariates
 dem_training <- all_data %>% dplyr::select(all_of(c(core_names,reduced_vars)))
 setDT(dem_training)[map.key, target := mapunit_ss_realm, on = c("mapunit1" = "basemapunit")]
@@ -203,8 +205,8 @@ ggplot(count_tp, aes(reorder(mapunit1, -n), n, fill = bgc)) +
        fill = "BGC Category") +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 70, hjust = 1)) # Rotate labels
-
-extra.required <- c('ESSFmc_02', 'ESSFmc_03', 'ESSFmc_06', 'ESSFmc_10',  'ESSFmcw_102', 'ESSFmcw_103',  'ESSFmcw_111', 'SBSmc2_02', 'SBSmc2_03', 'SBSmc2_09', 'SBSmc2_10', 'ESSFmc_W_t', 'ESSFmcw_W_t', 'SBSmc2_W_t')
+ggsave("./outputs/count_s1_training_bgc.png", width = 10, height = 10, units = "cm")
+# extra.required <- c('ESSFmc_02', 'ESSFmc_03', 'ESSFmc_06', 'ESSFmc_10',  'ESSFmcw_102', 'ESSFmcw_103',  'ESSFmcw_111', 'SBSmc2_02', 'SBSmc2_03', 'SBSmc2_09', 'SBSmc2_10', 'ESSFmc_W_t', 'ESSFmcw_W_t', 'SBSmc2_W_t')
 
 count_tp <- dem_training %>% filter(data_type == "extra") %>%  dplyr::count(mapunit1, bgc)
 ggplot(count_tp, aes(reorder(mapunit1, -n), n, fill = bgc)) +
@@ -216,7 +218,7 @@ ggplot(count_tp, aes(reorder(mapunit1, -n), n, fill = bgc)) +
        fill = "BGC Category") +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 70, hjust = 1)) 
-
+ggsave("./outputs/count_extra_training_bgc.png", width = 10, height = 10, units = "cm")
 count_tp <- dem_training %>% filter(data_type %in% c("s1", "extra")) %>%  dplyr::count(mapunit1, bgc)
 ## count for each bgc_cat
 ##review here for where extra points might be needed.
@@ -229,7 +231,7 @@ ggplot(count_tp, aes(reorder(mapunit1, -n), n, fill = bgc)) +
        fill = "BGC Category") +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 70, hjust = 1))
-
+ggsave("./outputs/count_s1_extra_training_bgc.png", width = 10, height = 10, units = "cm")
 downsample <- dem_training %>% filter(data_type %in% c("s1", "extra"))
 
 count_tp <- downsample  %>%  dplyr::count(mapunit1, bgc) %>% filter(n < 20) %>% droplevels()%>% pull(mapunit1)  
@@ -244,7 +246,7 @@ downsamples <- dem_training %>%
    downsamples <- recipe(mapunit1 ~ ., data = downsamples) %>%
   update_role(bgc, new_role = "id variable") %>%
   step_naomit(all_predictors()) %>%
-  step_downsample(mapunit1, under_ratio = 10000) %>%
+  step_downsample(mapunit1, under_ratio = 1000) %>%
   #step_smote(mapunit1, over_ratio = .05, neighbors = 5, skip = TRUE) %>%
   prep()
      downsamples <- juice(downsamples)
@@ -258,6 +260,8 @@ downsamples <- dem_training %>%
        fill = "BGC Category") +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 70, hjust = 1))
+   ggsave("./outputs/count_downsampled1000_training_bgc.png", width = 10, height = 10, units = "cm")   
+
 ```
 
 
@@ -267,19 +271,19 @@ trDat <- dem_training %>% filter(data_type == "s1")
 extra_dat <- dem_training %>% filter(data_type == "extra") %>% dplyr::select(id, bgc ,tid, mapunit1,  all_of(c(reduced_vars)))
 
 ## trDat=trDat ; extrarun = FALSE; model.name = ""; extradat = NULL; downsample = FALSE; smote = FALSE; use.neighbours = FALSE
-
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "base", model_type = "dem_sat_chm", extrarun = FALSE, extradat = NULL, downsample = FALSE, smote = FALSE, use.neighbours = FALSE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "extra", model_type = "dem_sat_chm",extrarun = TRUE, extradat = extra_dat, downsample = FALSE, smote = FALSE, use.neighbours = FALSE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down100",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 100, smote = FALSE, use.neighbours = FALSE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down500",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 500, smote = FALSE, use.neighbours = FALSE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1000",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1000, smote = FALSE, use.neighbours = FALSE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1500",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1000, smote = FALSE, use.neighbours = FALSE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "base_neighbor",model_type = "dem_sat_chm", extrarun = FALSE, extradat = NULL, downsample = FALSE, smote = FALSE, use.neighbours = TRUE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "extra_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = FALSE, smote = FALSE, use.neighbours = TRUE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down100_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 100, smote = FALSE, use.neighbours = TRUE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down500_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 500, smote = FALSE, use.neighbours = TRUE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1000_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1000, smote = FALSE, use.neighbours = TRUE)
-rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1500_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1500, smote = FALSE, use.neighbours = TRUE)
+# 
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "base", model_type = "dem_sat_chm", extrarun = FALSE, extradat = NULL, downsample = FALSE, smote = FALSE, use.neighbours = FALSE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "extra", model_type = "dem_sat_chm",extrarun = TRUE, extradat = extra_dat, downsample = FALSE, smote = FALSE, use.neighbours = FALSE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down100",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 100, smote = FALSE, use.neighbours = FALSE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down500",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 500, smote = FALSE, use.neighbours = FALSE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1000",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1000, smote = FALSE, use.neighbours = FALSE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1500",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1000, smote = FALSE, use.neighbours = FALSE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "base_neighbor",model_type = "dem_sat_chm", extrarun = FALSE, extradat = NULL, downsample = FALSE, smote = FALSE, use.neighbours = TRUE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "extra_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = FALSE, smote = FALSE, use.neighbours = TRUE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down100_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 100, smote = FALSE, use.neighbours = TRUE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down500_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 500, smote = FALSE, use.neighbours = TRUE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1000_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1000, smote = FALSE, use.neighbours = TRUE)
+# rf_models <-  build_model_raw_new(trDat=trDat , model.name = "down1500_neighbor",model_type = "dem_sat_chm", extrarun = TRUE, extradat = extra_dat, downsample = TRUE, downratio = 1500, smote = FALSE, use.neighbours = TRUE)
 ```
 summary of all models
 ```{r}
@@ -311,6 +315,16 @@ transposed_summary <- transposed_summary %>%
 gt::gt(transposed_summary)%>%
   gt::tab_options(
     table.font.size = gt::px(8))
+
+# Create the gt table
+gt_table <- gt::gt(transposed_summary) %>%
+  gt::tab_options(table.font.size = gt::px(8))
+
+# Save the table as an HTML file
+gt_table %>% gt::gtsave("transposed_summary.html")
+require(webshot)
+# Convert the HTML file to PNG
+webshot::webshot("transposed_summary.html", "./outputs/accuracy_comparisons.png")
 
 ```
 
